@@ -797,6 +797,7 @@ class GateTests(unittest.TestCase):
         ref = self.f.put("科学输入.json", {"scientific_work": work, "seeds": []})
         self.f.task["input_refs"].append(ref)
         self.f.task["scientific_work_ref"] = ref
+        self.f.task["task_scope"]["allowed_actions"] = ["read_local", "generate_local", "preserve_local"]
         return work
 
     def scientific_output(self):
@@ -928,6 +929,178 @@ class GateTests(unittest.TestCase):
         self.f.write()
         material.write_text("换稿", encoding="utf-8")
         self.f.check("checkpoint", 1, "hash_mismatch", rewrite=False)
+
+    def delivery_plan(self, delegated=False):
+        work = self.scientific()
+        plan = {"mode": "direct", "target": "小组/一组/科学稿.md"}
+        if delegated:
+            plan.update(mode="delegated-archive", archive_task_id="archive1", archive_agent_id="leader")
+            self.f.task["task_scope"]["allowed_actions"] = ["read_local"]
+            archive = copy.deepcopy(self.f.task)
+            archive.pop("scientific_work_ref")
+            archive.update(task_id="archive1", agent_id="leader", input_refs=[self.f.input])
+            archive["task_scope"]["allowed_actions"] = ["read_local", "preserve_local"]
+            self.f.control["tasks"]["archive1"] = {
+                "ref": self.f.put("归档任务.json", archive), "agent_id": "leader", "stage": archive["stage"], "status": "registered"}
+        work["deliverable"]["delivery_plan"] = plan
+        ref = self.f.put("科学输入.json", {"scientific_work": work, "seeds": []})
+        self.f.task["input_refs"][-1] = ref
+        self.f.task["scientific_work_ref"] = ref
+        return work
+
+    def replace_delivery_work(self, work):
+        ref = self.f.put("科学输入.json", {"scientific_work": work, "seeds": []})
+        self.f.task["input_refs"][-1] = ref
+        self.f.task["scientific_work_ref"] = ref
+
+    def test_scientific_implicit_direct_requires_real_local_actions(self):
+        self.scientific()
+        self.f.task["task_scope"]["allowed_actions"] = ["read_local"]
+        self.f.check(expected=2, diagnostic="scientific_delivery_permission", cli=True)
+        self.f.record.update(status="accepted", delivered_at=TIME, accepted_at=TIME)
+        self.f.check("entry", 2, "scientific_delivery_permission")
+        self.f.check("checkpoint")  # Old formed/read facts remain preservable without new admission.
+        self.f.task["task_scope"]["allowed_actions"].extend(["generate_local", "preserve_local"])
+        self.f.control["permissions"]["denied_actions"] = ["preserve_local"]
+        self.f.check("entry", 1, "permission_denied")
+
+    def test_scientific_direct_plan_and_cli(self):
+        self.delivery_plan()
+        self.f.check(cli=True)
+        self.f.record.update(status="accepted", delivered_at=TIME, accepted_at=TIME)
+        self.f.check("entry", cli=True)
+        self.f.record.update(status="completed", output_delivery=self.scientific_output())
+        self.f.check("checkpoint")
+
+    def test_scientific_delegated_archive_has_independent_authority(self):
+        self.delivery_plan(delegated=True)
+        self.f.control["permissions"]["denied_actions"] = ["generate_local"]
+        self.f.check(cli=True)
+        self.f.record.update(status="accepted", delivered_at=TIME, accepted_at=TIME)
+        self.f.check("entry")
+        self.f.control["permissions"]["denied_actions"].append("preserve_local")
+        self.f.check("entry", 1, "permission_denied")
+
+    def test_scientific_archive_task_actions_quota_and_refusals(self):
+        self.delivery_plan(delegated=True)
+        row = self.f.control["tasks"]["archive1"]
+        archive = json.loads((self.f.run / row["ref"]["path"]).read_bytes())
+        archive["task_scope"]["allowed_actions"] = ["read_local"]
+        row["ref"] = self.f.put("归档任务.json", archive)
+        self.f.check(expected=2, diagnostic="scientific_delivery_permission")
+        archive["task_scope"]["allowed_actions"].append("preserve_local")
+        archive["task_scope"]["limits"] = {"preserve_local": 1}
+        row["ref"] = self.f.put("归档任务.json", archive)
+        row["action_used"] = {"preserve_local": 1}
+        self.f.check(expected=1, diagnostic="scope_exhausted")
+        row["action_used"] = {}
+        row["refusal_actions"] = ["preserve_local"]
+        self.f.check(expected=1, diagnostic="permission_denied")
+        row.pop("refusal_actions")
+        self.f.control["restriction_refs"] = [self.f.put("归档限制.json", {"denied_actions": ["preserve_local"]})]
+        self.f.check(expected=1, diagnostic="permission_denied")
+
+    def test_scientific_archive_owner_and_registered_task_binding(self):
+        work = self.delivery_plan(delegated=True)
+        row = self.f.control["tasks"]["archive1"]
+        row["status"] = "completed"
+        self.f.check(expected=1, diagnostic="archive_task_terminal")
+        row["status"] = "registered"
+        row["agent_id"] = "other"
+        self.f.check(expected=1, diagnostic="route_mismatch")
+        row["agent_id"] = "leader"
+        work["deliverable"]["delivery_plan"]["archive_agent_id"] = "other"
+        self.replace_delivery_work(work)
+        self.f.check(expected=1, diagnostic="archive_owner")
+
+    def test_scientific_archive_cross_group_and_epoch_rejected(self):
+        self.delivery_plan(delegated=True)
+        row = self.f.control["tasks"]["archive1"]
+        archive = json.loads((self.f.run / row["ref"]["path"]).read_bytes())
+        archive["output_dir"] = "小组/另一组"
+        row["ref"] = self.f.put("归档任务.json", archive)
+        self.f.check(expected=1, diagnostic="archive_owner")
+        archive["output_dir"] = self.f.task["output_dir"]
+        archive["epoch"] = 2
+        row["ref"] = self.f.put("归档任务.json", archive)
+        self.f.check(expected=1, diagnostic="epoch_stale")
+
+    def test_scientific_target_and_material_must_match_this_task(self):
+        work = self.delivery_plan()
+        for target in ("小组/另一组/科学稿.md", "../科学稿.md", str(Path(self.f.temp.name) / "科学稿.md")):
+            work["deliverable"]["delivery_plan"]["target"] = target
+            self.replace_delivery_work(work)
+            self.f.check(expected=1, diagnostic="output_escape")
+        work["deliverable"]["delivery_plan"]["target"] = "小组/一组/约定原件.md"
+        self.replace_delivery_work(work)
+        self.f.record.update(status="completed", delivered_at=TIME, output_delivery=self.scientific_output())
+        self.f.check("checkpoint", 1, "output_target")
+        outside = self.f.run / "小组" / "另一组" / "科学稿.md"
+        outside.parent.mkdir()
+        outside.write_text("# 另一组原件\n", encoding="utf-8")
+        ref = self.f.ref(outside)
+        self.f.record["output_delivery"].update(material_ref=ref, read_material_ref=ref)
+        self.f.check("checkpoint", 1, "output_escape")
+
+    def test_scientific_target_parent_symlink_cannot_change_group(self):
+        work = self.delivery_plan()
+        other = self.f.run / "小组" / "另一组"
+        other.mkdir()
+        link = self.f.run / "小组" / "一组" / "别名"
+        link.symlink_to(other, target_is_directory=True)
+        work["deliverable"]["delivery_plan"]["target"] = "小组/一组/别名/科学稿.md"
+        self.replace_delivery_work(work)
+        self.f.check(expected=1, diagnostic="output_escape")
+
+    def test_scientific_checkpoint_does_not_require_new_archive_admission(self):
+        self.delivery_plan(delegated=True)
+        self.f.record.update(status="completed", delivered_at=TIME, output_delivery=self.scientific_output())
+        self.f.control["tasks"]["archive1"]["status"] = "stopped"
+        self.f.control["permissions"]["denied_actions"] = ["preserve_local"]
+        self.f.check("checkpoint")
+
+    def test_scientific_delegated_retains_prior_agent_and_recovery_refusals(self):
+        self.delivery_plan(delegated=True)
+        archive_row = self.f.control["tasks"]["archive1"]
+        archive = json.loads((self.f.run / archive_row["ref"]["path"]).read_bytes())
+        prior = copy.deepcopy(archive)
+        prior.update(task_id="prior-archive", agent_id="old-owner")
+        stop = {"task_id": prior["task_id"], "agent_id": prior["agent_id"], "runtime_id": "old-runtime",
+                "status": "stopped", "success": True, "stopped_at": TIME}
+        self.f.control["tasks"][prior["task_id"]] = {
+            "ref": self.f.put("旧归档任务.json", prior), "agent_id": prior["agent_id"], "stage": prior["stage"],
+            "status": "failed", "failure_id": "archive-failure", "runtime_id": "old-runtime", "runtime_state": "stopped",
+            "stop_receipt_ref": self.f.put("旧归档停止.json", stop), "refusal_actions": ["preserve_local"]}
+        archive["recovery_of"] = {"task_id": prior["task_id"], "failure_id": "archive-failure"}
+        archive_row["ref"] = self.f.put("归档任务.json", archive)
+        self.f.control["recoveries"]["prior-archive/archive-failure"] = {
+            "task_id": prior["task_id"], "failure_id": "archive-failure", "replacement_task_id": "archive1"}
+        self.f.check(expected=1, diagnostic="permission_denied")
+        self.f.control["tasks"][prior["task_id"]]["refusal_actions"] = []
+        self.f.check()
+        archive.pop("recovery_of")
+        archive_row["ref"] = self.f.put("归档任务.json", archive)
+        # The separate healthy-reuse case needs a matching stop and no unresolved failure.
+        prior["agent_id"] = stop["agent_id"] = "leader"
+        self.f.control["recoveries"].clear()
+        previous_row = self.f.control["tasks"][prior["task_id"]]
+        previous_row.pop("failure_id")
+        previous_row.update(ref=self.f.put("旧归档任务.json", prior), agent_id="leader", status="stopped",
+                            stop_receipt_ref=self.f.put("旧归档停止.json", stop), refusal_actions=["preserve_local"])
+        self.f.check(expected=1, diagnostic="permission_denied")
+
+    def test_scientific_plan_boolean_self_delegation_and_unknown_fields_rejected(self):
+        work = self.delivery_plan()
+        work["deliverable"]["delivery_plan"] = True
+        self.replace_delivery_work(work)
+        self.f.check(expected=1, diagnostic="type")
+        work["deliverable"]["delivery_plan"] = {"mode": "direct", "target": "小组/一组/科学稿.md", "authorized": True}
+        self.replace_delivery_work(work)
+        self.f.check(expected=1, diagnostic="delivery_plan_fields")
+        work["deliverable"]["delivery_plan"] = {"mode": "delegated-archive", "target": "小组/一组/科学稿.md",
+                                                "archive_task_id": "t1", "archive_agent_id": "leader"}
+        self.replace_delivery_work(work)
+        self.f.check(expected=1, diagnostic="archive_owner")
 
     def inspect_tasks(self, count=35):
         for i in range(count):

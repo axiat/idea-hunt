@@ -26,7 +26,8 @@ EVIDENCE_FIELDS = {"evidence", "evidence_ref"}
 FIELDS = {"register": {"task_ref"}, "input_observed": {"status"},
           "start_observed": {"runtime_id", "entry_receipt_ref", "entry_receipt"},
           "output_observed": {"output_delivery"}, "complete": set(),
-          "terminal_observed": {"status", "failure_id", "runtime_id", "stop_receipt_ref"}}
+          "terminal_observed": {"status", "failure_id", "runtime_id", "stop_receipt_ref"},
+          "cancel_unstarted": {"unstarted_receipt_ref"}}
 TERMINAL = {"completed", "failed", "stopped"}
 OUTPUT_FIELDS = {"material_ref", "version", "formed_at", "delivered_at", "archived_at", "read_at",
                  "reader_id", "read_version", "read_material_ref"}
@@ -45,10 +46,17 @@ def validate_event(event):
     if kind == "start_observed":
         gate.require(len(set(event) & {"entry_receipt", "entry_receipt_ref"}) == 1,
                      "entry_receipt_invalid", "exactly one entry_receipt or entry_receipt_ref required")
+    if kind == "cancel_unstarted":
+        gate.require("unstarted_receipt_ref" in event, "unstarted_receipt_invalid", "non-start receipt required")
     for field in ("event_id", "task_id", "agent_id", "stage"):
         gate.text(event.get(field), field)
     gate.timestamp(event.get("occurred_at"), "occurred_at")
     return kind
+
+
+def administrative_preservation(event):
+    return event["type"] == "cancel_unstarted" or (
+        event["type"] == "terminal_observed" and event.get("status") == "stopped")
 
 
 def legacy_output(record, output, observation):
@@ -73,6 +81,24 @@ def legacy_output(record, output, observation):
             gate.require(record["read_version"] == output.get("read_version"), "output_conflict", "legacy read version differs")
         if "read_material_ref" in record:
             gate.require(record["read_material_ref"] == output.get("read_material_ref"), "output_conflict", "legacy read original differs")
+
+
+def preserves_existing_output(checker, prior, output):
+    """Recognize only an original already held by the committed root snapshot."""
+    if type(prior) is not dict or type(output) is not dict:
+        return False
+    previous = prior.get("output_delivery")
+    if type(previous) is dict:
+        return all(k in previous and k in output and previous[k] == output[k] for k in ("material_ref", "version"))
+    if "output_delivery" in prior or prior.get("status") != "completed":
+        return False
+    if not all(k in prior for k in ("material_ref", "formed_at", "delivered_at")):
+        return False
+    checker.facts(prior)
+    observation = {"legacy_material_path": str(checker.ref(prior["material_ref"])),
+                   "output_material_path": str(checker.ref(output["material_ref"]))}
+    legacy_output(prior, output, observation)
+    return True
 
 
 def reduce_events(root, events, observations, recorded_at):
@@ -107,10 +133,12 @@ def reduce_events(root, events, observations, recorded_at):
             tasks[tid] = row
         else:
             gate.require(row is not None, "task_unregistered", tid)
+            gate.require("unstarted_cancellation" not in row, "task_cancelled", tid)
             terminal = row.get("status") in TERMINAL
             # Late archival/output facts and a real stop may preserve a terminal task.
             gate.require(not terminal or kind == "output_observed" or
-                         (kind == "terminal_observed" and event.get("status") == "stopped" and row.get("status") in {"failed", "completed"}),
+                         (kind == "terminal_observed" and event.get("status") == "stopped" and row.get("status") in {"failed", "completed", "stopped"}) or
+                         (kind == "cancel_unstarted" and row.get("status") == "stopped"),
                          "task_terminal", tid)
             runtime_stop = kind == "terminal_observed" and event.get("status") == "stopped"
             if runtime_stop:
@@ -180,6 +208,18 @@ def reduce_events(root, events, observations, recorded_at):
             elif kind == "complete":
                 gate.require(row["status"] == "started", "event_order", "completion needs actual start")
                 row.update(status="completed", completed_at=event["occurred_at"])
+            elif kind == "cancel_unstarted":
+                gate.require(row.get("status") in {"registered", "stopped"} and "failure_id" not in row,
+                             "unstarted_conflict", "cancellation cannot erase a failure or known work")
+                forbidden = {"delivery_enqueued_at", "delivered_at", "accepted_at", "started_at", "runtime_id",
+                             "entry_receipt", "entry_receipt_ref", "stop_receipt_ref", "output_delivery"}
+                gate.require(not forbidden.intersection(row) and row.get("runtime_state") in (None, "unknown"),
+                             "unstarted_conflict", "known delivery, execution or output fact exists")
+                receipt = gate.obj(observation.get("unstarted_receipt"), "unstarted_receipt")
+                gate.require(gate.timestamp(receipt.get("cancelled_at"), "cancelled_at") == when,
+                             "event_order", "cancellation receipt time differs")
+                row["unstarted_cancellation"] = {"receipt_ref": copy.deepcopy(event["unstarted_receipt_ref"]),
+                                                "cancelled_at": event["occurred_at"]}
             elif kind == "terminal_observed":
                 state = event.get("status")
                 gate.require(state in {"failed", "stopped"}, "terminal_status", "failed or stopped required")
@@ -209,7 +249,7 @@ def reduce_events(root, events, observations, recorded_at):
     return result, sorted(set(changed))
 
 
-def observe(root, events, checker, root_sha, owner):
+def observe(root, events, checker, root_sha, owner, original_tasks):
     observations = {}
     control = root["harness_control"]
     for event in events:
@@ -237,10 +277,39 @@ def observe(root, events, checker, root_sha, owner):
         task = checker.ref(ref, True)
         gate.require(task.get("schema_version") == 1 and type(task["schema_version"]) is int,
                      "task_schema", "v1 task required")
-        gate.require(task.get("run_id") == checker.run.name and task.get("epoch") == control.get("epoch"),
-                     "epoch_stale", "task run/epoch differs")
+        if administrative_preservation(event):
+            gate.require(task.get("run_id") == checker.run.name, "run_id", "task run differs")
+            gate.number(task.get("epoch"), "task.epoch")
+            gate.require(0 < task["epoch"] <= control["epoch"], "epoch_stale", "administrative preservation requires an existing task epoch")
+        else:
+            gate.require(task.get("run_id") == checker.run.name and task.get("epoch") == control.get("epoch"),
+                         "epoch_stale", "task run/epoch differs")
         for field in ("task_id", "agent_id", "stage"):
             gate.require(task.get(field) == event.get(field), "route_mismatch", field)
+        if administrative_preservation(event):
+            gate.require(row is not None, "task_unregistered", tid)
+            for field in ("agent_id", "stage"):
+                gate.require(row.get(field) == event[field], "route_mismatch", field)
+            observation = {"task": task}
+            if kind == "cancel_unstarted":
+                gate.require(evidence["observer_id"] == owner, "unstarted_observer_mismatch", "root owner must observe cancellation")
+                marker = {"receipt_ref": event["unstarted_receipt_ref"], "cancelled_at": event["occurred_at"]}
+                gate.require("unstarted_cancellation" not in row or row["unstarted_cancellation"] == marker,
+                             "event_conflict", "cancellation facts are append-only")
+                receipt = checker.unstarted_cancelled(tid, dict(row, unstarted_cancellation=marker), owner)
+                gate.require(gate.timestamp(receipt["cancelled_at"], "cancelled_at") == gate.timestamp(event["occurred_at"], "occurred_at"),
+                             "event_order", "cancellation receipt time differs")
+                observation["unstarted_receipt"] = receipt
+            else:
+                gate.text(event.get("runtime_id"), "runtime_id")
+                gate.require("runtime_id" not in row or row["runtime_id"] == event["runtime_id"], "route_mismatch", "runtime_id")
+                checker.stopped(tid, dict(row, runtime_id=event["runtime_id"], runtime_state="stopped",
+                                         stop_receipt_ref=event.get("stop_receipt_ref")))
+                receipt = checker.ref(event["stop_receipt_ref"], True)
+                gate.require(gate.timestamp(receipt["stopped_at"], "stopped_at") == gate.timestamp(event["occurred_at"], "occurred_at"),
+                             "event_order", "stopped_at differs from observed time")
+            observations[event["event_id"]] = observation
+            continue
         checker.ref(task.get("role_ref"))
         checker.refs(task.get("input_refs"), "input_refs")
         checker.output(task.get("output_dir"))
@@ -289,15 +358,6 @@ def observe(root, events, checker, root_sha, owner):
             when = gate.timestamp(event["occurred_at"], "occurred_at")
             gate.require(all(gate.timestamp(output[k], k) <= when for k in gate.FACTS if k in output),
                          "event_order", "output facts follow observation")
-        if kind == "terminal_observed" and event.get("status") == "stopped":
-            gate.text(event.get("runtime_id"), "runtime_id")
-            gate.require(row is not None and ("runtime_id" not in row or row["runtime_id"] == event["runtime_id"]),
-                         "route_mismatch", "runtime_id")
-            checker.stopped(tid, dict(row, runtime_id=event["runtime_id"], runtime_state="stopped",
-                                     stop_receipt_ref=event.get("stop_receipt_ref")))
-            receipt = checker.ref(event["stop_receipt_ref"], True)
-            gate.require(gate.timestamp(receipt["stopped_at"], "stopped_at") == gate.timestamp(event["occurred_at"], "occurred_at"),
-                         "event_order", "stopped_at differs from observed time")
         observation = {"task": task}
         if kind == "output_observed" and row is not None and row.get("status") == "completed" and "output_delivery" not in row:
             gate.require(all(k in row for k in ("material_ref", "formed_at", "delivered_at")),
@@ -305,6 +365,10 @@ def observe(root, events, checker, root_sha, owner):
             checker.facts(row)
             observation["legacy_material_path"] = str(checker.ref(row["material_ref"]))
             observation["output_material_path"] = str(checker.ref(event["output_delivery"]["material_ref"]))
+        if kind == "output_observed":
+            preserve = preserves_existing_output(checker, original_tasks.get(tid), event["output_delivery"])
+            preserve = preserve and preserves_existing_output(checker, row, event["output_delivery"])
+            checker.scientific(task, dict(row, output_delivery=event["output_delivery"]), preserve_existing=preserve)
         observations[event["event_id"]] = observation
     return observations
 
@@ -334,7 +398,7 @@ def prepare(run, owner, expected_root_sha, events, recorded_at):
     result = root
     changed = []
     for event in events:
-        current = observe(result, [event], checker, expected_root_sha, owner)
+        current = observe(result, [event], checker, expected_root_sha, owner, control["tasks"])
         observations.update(current)
         result, touched = reduce_events(result, [event], current, recorded_at)
         changed.extend(touched)
@@ -344,7 +408,10 @@ def prepare(run, owner, expected_root_sha, events, recorded_at):
         checker.facts(row)
         if "checkpoint" in row:
             checker.refs(gate.obj(row["checkpoint"], "checkpoint").get("saved_refs"), "checkpoint.saved_refs")
-        checker.scientific(observations[next(e["event_id"] for e in events if e["task_id"] == tid)]["task"], row)
+        task_events = [e for e in events if e["task_id"] == tid]
+        if any(not administrative_preservation(e) for e in task_events):
+            preserve = preserves_existing_output(checker, control["tasks"].get(tid), row.get("output_delivery"))
+            checker.scientific(observations[task_events[0]["event_id"]]["task"], row, preserve_existing=preserve)
     checker.recheck()
     return checker, original, result, changed
 

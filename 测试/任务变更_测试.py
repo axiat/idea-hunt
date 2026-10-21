@@ -107,7 +107,35 @@ class MutationTests(unittest.TestCase):
         ref = self.f.put("科学合同.json", {"scientific_work": work, "seeds": []})
         self.f.task["input_refs"].append(ref)
         self.f.task["scientific_work_ref"] = ref
+        self.f.task["task_scope"]["allowed_actions"] += ["generate_local", "preserve_local"]
         self.f.write()
+
+    def cancellation_event(self, status="stopped"):
+        root = self.root()
+        row = root["harness_control"]["tasks"]["t1"]
+        report = {"ok": False, "decision": "fail", "phase": "dispatch", "task_id": "t1",
+                  "diagnostics": [{"level": "error", "code": "source_cost", "detail": "synthetic rejected dispatch"}]}
+        row.update(status=status, actor_started_or_delivered=False, source_actions_executed=0,
+                   action_used={"read_local": 0}, dispatch_check_report=report, dispatch_checked_at_utc=TIME,
+                   material_ref=copy.deepcopy(row["ref"]), formed_at=TIME)
+        self.root_path.write_text(json.dumps(root))
+        task = json.loads((self.f.run / row["ref"]["path"]).read_bytes())
+        receipt = {"schema_version": 1, "run_id": self.f.run.name, "task_id": "t1",
+                   "task_sha256": row["ref"]["sha256"], "epoch": task["epoch"], "agent_id": "agent1",
+                   "stage": task["stage"], "status": "not_started", "success": True,
+                   "cancelled_at": LATER, "confirmed_by": "main", "dispatch_check_report": copy.deepcopy(report),
+                   "delivery_enqueued": False, "delivered": False, "accepted": False, "started": False,
+                   "pending_delivery": False, "source_actions_executed": 0,
+                   "observation": {"kind": "tool", "id": "synthetic-owner-non-start-observation",
+                                   "observer_id": "main", "observed_at": LATER}}
+        ref = self.f.put("未启动收据.json", receipt)
+        return self.inline_evidence(self.event("cancel_unstarted", occurred_at=LATER, unstarted_receipt_ref=ref),
+                                    observer="main")
+
+    def cancellation_receipt(self, event, receipt):
+        changed = copy.deepcopy(event)
+        changed["unstarted_receipt_ref"] = self.f.put("错误未启动收据.json", receipt)
+        return self.inline_evidence(changed, observer="main")
 
     def test_default_preview_creates_no_files(self):
         event = self.event()
@@ -817,6 +845,80 @@ class MutationTests(unittest.TestCase):
         event = self.timed_stop_event("2026-10-14T09:59:59+00:00", "2026-10-14T10:00:40+00:00")
         self.update([event], expected=1, diagnostic="stop_receipt_invalid")
 
+    def historical_cross_directory_output(self, *, registered=True, legacy=False):
+        self.adopt_science()
+        self.start()
+        material = self.f.run / "小组" / "历史归档" / "科学稿.md"
+        material.parent.mkdir(parents=True, exist_ok=True)
+        material.write_text("# 历史判断\n合成原件。\n", encoding="utf-8")
+        output = {"material_ref": self.f.ref(material), "version": "v1", "formed_at": TIME,
+                  "delivered_at": TIME, "archived_at": TIME}
+        if registered:
+            root = self.root()
+            row = root["harness_control"]["tasks"]["t1"]
+            row["checkpoint"]["saved_refs"].append(output["material_ref"])
+            if legacy:
+                row.update(status="completed", material_ref=output["material_ref"], formed_at=TIME,
+                           delivered_at=TIME, completed_at=TIME, version="v1")
+            else:
+                row["output_delivery"] = copy.deepcopy(output)
+            self.root_path.write_text(json.dumps(root))
+        return output
+
+    def test_historical_cross_directory_same_original_can_append_actual_read(self):
+        output = self.historical_cross_directory_output()
+        original = self.root()["harness_control"]["tasks"]["t1"]["output_delivery"]
+        read = dict(output, read_at=LATER, reader_id="leader", read_version="v1", read_material_ref=output["material_ref"])
+        self.update([self.event("output_observed", output_delivery=read, occurred_at=LATER)])
+        row = self.root()["harness_control"]["tasks"]["t1"]
+        self.assertEqual({k: row["output_delivery"][k] for k in original}, original)
+        self.assertEqual(row["output_delivery"]["read_at"], LATER)
+        self.update([self.event("complete", occurred_at=LATER)])
+        self.assertEqual(self.root()["harness_control"]["tasks"]["t1"]["status"], "completed")
+
+    def test_historical_cross_directory_legacy_original_can_append_actual_read(self):
+        output = self.historical_cross_directory_output(legacy=True)
+        original = self.root()["harness_control"]["tasks"]["t1"]
+        read = dict(output, read_at=LATER, reader_id="leader", read_version="v1", read_material_ref=output["material_ref"])
+        self.update([self.event("output_observed", output_delivery=read, occurred_at=LATER)])
+        row = self.root()["harness_control"]["tasks"]["t1"]
+        for field in ("status", "material_ref", "version", "formed_at", "delivered_at", "completed_at", "checkpoint"):
+            self.assertEqual(row[field], original[field])
+        self.assertEqual(row["output_delivery"], read)
+
+    def test_new_cross_directory_output_remains_rejected(self):
+        output = self.historical_cross_directory_output(registered=False)
+        self.update([self.event("output_observed", output_delivery=output)], expected=1, diagnostic="output_escape")
+        self.assertNotIn("output_delivery", self.root()["harness_control"]["tasks"]["t1"])
+
+    def test_historical_cross_directory_changed_original_or_version_is_not_preserved(self):
+        output = self.historical_cross_directory_output()
+        other = self.f.run / "小组" / "历史归档" / "另一原件.md"
+        other.write_text("# 另一判断\n合成新版。\n", encoding="utf-8")
+        changed = dict(output, material_ref=self.f.ref(other))
+        self.update([self.event("output_observed", output_delivery=changed)], expected=1, diagnostic="output_escape")
+        self.update([self.event("output_observed", output_delivery=dict(output, version="v2"))], expected=1, diagnostic="output_version")
+        self.assertEqual(self.root()["harness_control"]["tasks"]["t1"]["output_delivery"], output)
+
+    def test_historical_original_cannot_hide_cross_directory_replacement_in_one_batch(self):
+        output = self.historical_cross_directory_output()
+        other = self.f.run / "小组" / "历史归档" / "临时换稿.md"
+        other.write_text("# 换稿\n合成内容。\n", encoding="utf-8")
+        changed = dict(output, material_ref=self.f.ref(other))
+        self.update([self.event("output_observed", output_delivery=changed),
+                     self.event("output_observed", output_delivery=output)], expected=1, diagnostic="output_escape")
+        in_directory = self.output(read=False)
+        self.update([self.event("output_observed", output_delivery=in_directory),
+                     self.event("output_observed", output_delivery=output)], expected=1, diagnostic="output_escape")
+        self.assertEqual(self.root()["harness_control"]["tasks"]["t1"]["output_delivery"], output)
+
+    def test_historical_original_completion_still_requires_actual_read_and_reader(self):
+        output = self.historical_cross_directory_output()
+        self.update([self.event("complete", occurred_at=LATER)], expected=1, diagnostic="scientific_delivery_missing")
+        wrong = dict(output, read_at=LATER, reader_id="other", read_version="v1", read_material_ref=output["material_ref"])
+        self.update([self.event("output_observed", output_delivery=wrong, occurred_at=LATER)], expected=1, diagnostic="output_reader")
+        self.assertEqual(self.root()["harness_control"]["tasks"]["t1"]["status"], "started")
+
     def legacy_completed(self):
         output = self.output(read=False)
         root = self.root()
@@ -1100,6 +1202,272 @@ class MutationTests(unittest.TestCase):
             self.assertEqual(result["diagnostics"][0]["code"], "path_invalid")
             self.assertEqual(self.root_path.read_bytes(), before)
 
+    def test_legacy_stopped_can_append_missing_real_runtime_receipt(self):
+        root = self.root()
+        root["harness_control"]["tasks"]["t1"].update(status="stopped", stopped_at_utc=TIME,
+                                                      stop_reason="synthetic legacy administrative label")
+        self.root_path.write_text(json.dumps(root))
+        event = self.stop_event()
+        event.pop("failure_id")
+        self.update([self.evidence(event)])
+        row = self.root()["harness_control"]["tasks"]["t1"]
+        self.assertEqual(row["status"], "stopped")
+        self.assertEqual(row["runtime_id"], "runtime1")
+        self.assertEqual(row["runtime_state"], "stopped")
+        self.assertEqual(row["stopped_at_utc"], TIME)
+        self.assertNotIn("failure_id", row)
+        self.assertNotIn("started_at", row)
+        self.update([self.evidence(event)])
+
+    def test_old_epoch_real_stop_preserves_science_with_changed_historical_norm(self):
+        self.adopt_science()
+        self.start()
+        output = self.output()
+        self.update([self.event("output_observed", output_delivery=output)])
+        self.update([self.event("terminal_observed", status="failed", failure_id="f1")])
+        root = self.root()
+        root["status"] = "paused_by_user"
+        root["harness_control"].update(epoch=2, paused=True)
+        self.root_path.write_text(json.dumps(root))
+        before = self.root()
+        (self.f.run / self.f.role["path"]).write_text('{"role":"updated norm"}')
+        (self.f.run / self.f.task["scientific_work_ref"]["path"]).write_text('{"scientific_work":"updated norm"}')
+        self.update([self.stop_event()])
+        after = self.root()
+        row = after["harness_control"]["tasks"]["t1"]
+        prior = before["harness_control"]["tasks"]["t1"]
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["failure_id"], "f1")
+        self.assertEqual(row["output_delivery"], output)
+        self.assertEqual(row["checkpoint"], prior["checkpoint"])
+        self.assertEqual(row["ref"], prior["ref"])
+        self.assertEqual(row["runtime_state"], "stopped")
+        self.assertTrue(after["harness_control"]["paused"])
+        self.assertEqual(after["harness_control"]["epoch"], 2)
+        self.assertEqual(after["harness_control"]["source_ledger_ref"], before["harness_control"]["source_ledger_ref"])
+        for kind, fields in (("input_observed", {}), ("complete", {}),
+                             ("terminal_observed", {"status": "failed", "failure_id": "f1"})):
+            self.update([self.event(kind, **fields)], expected=1, diagnostic="epoch_stale")
+
+    def test_old_epoch_real_stop_checks_runtime_owner_cas_and_preserved_outputs(self):
+        self.start()
+        root = self.root()
+        root["harness_control"]["epoch"] = 2
+        self.root_path.write_text(json.dumps(root))
+        self.update([self.stop_event(runtime_id="other")], expected=1, diagnostic="stop_receipt_invalid")
+        event = self.stop_event()
+        event["runtime_id"] = "other"
+        self.update([self.evidence(event)], expected=1, diagnostic="route_mismatch")
+        self.update([self.stop_event()], owner="other", expected=1, diagnostic="owner_mismatch")
+        self.update([self.stop_event()], digest="0" * 64, expected=1, diagnostic="cas_conflict")
+        self.update([self.stop_event(message="No task found")], expected=1, diagnostic="stop_receipt_invalid")
+        self.update([self.stop_event()])
+        root = self.root()
+        root["harness_control"]["tasks"]["t1"]["stop_receipt_ref"] = self.f.put("既存停止.json", {
+            "task_id": "t1", "agent_id": "agent1", "runtime_id": "runtime1", "status": "stopped",
+            "success": True, "stopped_at": TIME})
+        self.root_path.write_text(json.dumps(root))
+        self.update([self.stop_event()], expected=1, diagnostic="event_conflict")
+
+    def test_future_epoch_real_stop_and_changed_envelope_are_rejected(self):
+        self.f.task["epoch"] = 2
+        self.f.write()
+        self.update([self.stop_event()], expected=1, diagnostic="epoch_stale")
+        self.f.task["epoch"] = 1
+        self.f.write()
+        self.f.path.write_bytes(self.f.path.read_bytes() + b" ")
+        self.update([self.stop_event()], expected=1, diagnostic="hash_mismatch")
+
+    def test_old_epoch_stop_does_not_resolve_failed_logical_task(self):
+        self.start()
+        self.update([self.event("terminal_observed", status="failed", failure_id="f1")])
+        root = self.root()
+        root["harness_control"]["epoch"] = 2
+        self.root_path.write_text(json.dumps(root))
+        self.update([self.stop_event()])
+        root = self.root()
+        self.assertEqual(root["harness_control"]["tasks"]["t1"]["status"], "failed")
+        self.assertEqual(root["harness_control"]["tasks"]["t1"]["failure_id"], "f1")
+        task = copy.deepcopy(self.f.task)
+        task.update(task_id="next", epoch=2)
+        ref = self.f.put("停止后新任务.json", task)
+        root["harness_control"]["tasks"]["next"] = {"ref": ref, "agent_id": "agent1", "stage": task["stage"], "status": "registered"}
+        self.root_path.write_text(json.dumps(root))
+        code, result = mutation.gate.check_task(self.f.run, ref["path"], "dispatch")
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result["diagnostics"][-1]["code"], "recovery_missing")
+
+    def test_cancel_unstarted_preview_and_apply_preserve_original_state(self):
+        event = self.cancellation_event()
+        before = self.root()
+        files = {str(p): p.read_bytes() for p in self.f.run.rglob("*") if p.is_file()}
+        result = self.update([event], apply=False)
+        self.assertFalse(result["action_permission"])
+        self.assertEqual(files, {str(p): p.read_bytes() for p in self.f.run.rglob("*") if p.is_file()})
+        self.update([event])
+        after = self.root()
+        row = after["harness_control"]["tasks"]["t1"]
+        self.assertEqual(row["status"], "stopped")
+        self.assertEqual(row["unstarted_cancellation"], {"receipt_ref": event["unstarted_receipt_ref"], "cancelled_at": LATER})
+        self.assertNotIn("runtime_id", row)
+        self.assertNotIn("runtime_state", row)
+        self.assertNotIn("stop_receipt_ref", row)
+        after["harness_control"]["tasks"]["t1"].pop("unstarted_cancellation")
+        after["harness_control"]["tasks"]["t1"].pop("lifecycle_events")
+        self.assertEqual(after, before)
+
+    def test_cancel_unstarted_registered_label_is_not_a_receipt(self):
+        event = self.inline_evidence(self.event("cancel_unstarted", unstarted_receipt_ref=self.f.input), observer="main")
+        self.update([event], expected=1, diagnostic="unstarted_receipt_invalid")
+        event = self.cancellation_event(status="registered")
+        self.update([event])
+        self.assertEqual(self.root()["harness_control"]["tasks"]["t1"]["status"], "registered")
+        self.assertEqual(mutation.gate.check_task(self.f.run, self.f.path, "dispatch")[1]["diagnostics"][-1]["code"], "task_cancelled")
+
+    def test_cancel_unstarted_replay_is_idempotent_and_marker_is_immutable(self):
+        event = self.cancellation_event()
+        self.update([event])
+        original = self.root_path.read_bytes()
+        self.update([event])
+        self.assertEqual(original, self.root_path.read_bytes())
+        changed = copy.deepcopy(event)
+        changed["event_id"] = "another-cancellation"
+        changed["occurred_at"] = "2026-10-14T10:00:31+00:00"
+        self.update([self.inline_evidence(changed, observer="main")], expected=1, diagnostic="event_conflict")
+
+    def test_cancel_unstarted_old_epoch_and_old_norm_are_administrative_only(self):
+        self.f.control["epoch"] = 2
+        self.f.control["paused"] = True
+        self.f.root["status"] = "paused_by_user"
+        self.f.record["checkpoint"]["saved_refs"] = []
+        self.f.task["scientific_work_ref"] = self.f.input
+        self.f.write()
+        event = self.cancellation_event()
+        before = self.root()
+        (self.f.run / self.f.role["path"]).write_text('{"role":"new norm"}')
+        (self.f.run / self.f.input["path"]).write_text('{"input":"new norm"}')
+        self.update([event])
+        after = self.root()
+        self.assertEqual(after["harness_control"]["epoch"], 2)
+        self.assertTrue(after["harness_control"]["paused"])
+        self.assertEqual(after["harness_control"]["tasks"]["t1"]["ref"], before["harness_control"]["tasks"]["t1"]["ref"])
+        self.assertEqual(json.loads(self.f.path.read_bytes())["epoch"], 1)
+        entry = self.inline_evidence(self.event(occurred_at=LATER), observer="main")
+        self.update([entry], expected=1, diagnostic="epoch_stale")
+
+    def test_cancel_unstarted_receipt_bindings_are_exact(self):
+        event = self.cancellation_event()
+        receipt = json.loads((self.f.run / event["unstarted_receipt_ref"]["path"]).read_bytes())
+        for key, value in (("task_id", "wrong"), ("agent_id", "wrong"), ("stage", "wrong"),
+                           ("run_id", "wrong"), ("task_sha256", "0" * 64), ("epoch", 2),
+                           ("confirmed_by", "observer"), ("status", "stopped"), ("success", 1),
+                           ("delivery_enqueued", True), ("delivered", True), ("accepted", True),
+                           ("started", True), ("pending_delivery", True), ("source_actions_executed", False)):
+            with self.subTest(key=key):
+                bad = dict(receipt, **{key: value})
+                self.update([self.cancellation_receipt(event, bad)], expected=1, diagnostic="unstarted_receipt_invalid")
+        for key in ("pending_delivery", "observation", "dispatch_check_report"):
+            bad = copy.deepcopy(receipt)
+            bad.pop(key)
+            self.update([self.cancellation_receipt(event, bad)], expected=1, diagnostic="unstarted_receipt_invalid")
+
+    def test_cancel_unstarted_rejects_known_execution_and_output_conflicts(self):
+        event = self.cancellation_event()
+        original = self.root()
+        changes = ({"delivery_enqueued_at": TIME}, {"delivered_at": TIME}, {"accepted_at": TIME},
+                   {"delivery_enqueued": True}, {"delivered": True}, {"accepted": True}, {"started": True},
+                   {"pending_delivery": True}, {"delivery_enqueued": 0},
+                   {"started_at": TIME}, {"runtime_id": "runtime1"}, {"runtime_state": "running"},
+                   {"entry_receipt": {}}, {"stop_receipt_ref": self.f.input}, {"output_delivery": {}},
+                   {"actor_started_or_delivered": True}, {"source_actions_executed": 1},
+                   {"action_used": {"read_local": 1}}, {"failure_id": "f1"},
+                   {"material_ref": self.f.input}, {"lifecycle_events": {"old": {"event": {"type": "input_observed"}}}})
+        for fields in changes:
+            with self.subTest(fields=fields):
+                root = copy.deepcopy(original)
+                root["harness_control"]["tasks"]["t1"].update(fields)
+                self.root_path.write_text(json.dumps(root))
+                self.update([event], expected=1, diagnostic="unstarted_conflict")
+
+    def test_cancel_unstarted_requires_failed_dispatch_and_real_owner_observation(self):
+        event = self.cancellation_event()
+        receipt = json.loads((self.f.run / event["unstarted_receipt_ref"]["path"]).read_bytes())
+        bad = copy.deepcopy(receipt)
+        bad["dispatch_check_report"]["decision"] = "allow"
+        self.update([self.cancellation_receipt(event, bad)], expected=1, diagnostic="unstarted_receipt_invalid")
+        bad = copy.deepcopy(receipt)
+        bad["observation"]["id"] = "No task found"
+        self.update([self.cancellation_receipt(event, bad)], expected=1, diagnostic="unstarted_receipt_invalid")
+        bad = copy.deepcopy(receipt)
+        bad["observation"]["observer_id"] = "other"
+        self.update([self.cancellation_receipt(event, bad)], expected=1, diagnostic="unstarted_receipt_invalid")
+        bad = copy.deepcopy(receipt)
+        bad["observation"]["observed_at"] = TIME
+        self.update([self.cancellation_receipt(event, bad)], expected=1, diagnostic="event_order")
+        self.update([self.inline_evidence(event)], expected=1, diagnostic="unstarted_observer_mismatch")
+        self.update([event], owner="other", expected=1, diagnostic="owner_mismatch")
+
+    def test_cancel_unstarted_cas_receipt_and_saved_material_are_rechecked(self):
+        event = self.cancellation_event()
+        self.update([event], digest="0" * 64, expected=1, diagnostic="cas_conflict")
+        original = mutation.gate.Checker.recheck
+        proof = self.f.run / event["unstarted_receipt_ref"]["path"]
+        def changed(checker, *args, **kwargs):
+            proof.write_bytes(proof.read_bytes() + b" ")
+            return original(checker, *args, **kwargs)
+        with mock.patch.object(mutation.gate.Checker, "recheck", changed):
+            self.update([event], apply=False, expected=1, diagnostic="file_changed")
+        event = self.cancellation_event()
+        (self.f.run / self.f.input["path"]).write_bytes(b"overwritten saved material")
+        self.update([event], expected=1, diagnostic="hash_mismatch")
+
+    def test_cancel_unstarted_does_not_revive_task_and_allows_checked_role_reuse(self):
+        event = self.cancellation_event()
+        self.update([event])
+        self.update([self.event(occurred_at=LATER)], expected=1, diagnostic="task_cancelled")
+        for phase in ("dispatch", "entry"):
+            code, result = mutation.gate.check_task(self.f.run, self.f.path, phase)
+            self.assertEqual(code, 1, result)
+            self.assertEqual(result["diagnostics"][-1]["code"], "task_cancelled")
+        self.assertEqual(mutation.gate.check_task(self.f.run, self.f.path, "checkpoint")[0], 0)
+        task = copy.deepcopy(self.f.task)
+        task["task_id"] = "next"
+        ref = self.f.put("后续任务.json", task)
+        root = self.root()
+        root["harness_control"]["tasks"]["next"] = {"ref": ref, "agent_id": "agent1", "stage": task["stage"], "status": "registered"}
+        self.root_path.write_text(json.dumps(root))
+        code, result = mutation.gate.check_task(self.f.run, ref["path"], "dispatch")
+        self.assertEqual(code, 0, result)
+        root["harness_control"]["tasks"]["t1"]["refusal_actions"] = ["read_local"]
+        self.root_path.write_text(json.dumps(root))
+        code, result = mutation.gate.check_task(self.f.run, ref["path"], "dispatch")
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result["diagnostics"][-1]["code"], "permission_denied")
+
+    def test_cancel_unstarted_future_epoch_and_event_fields_are_rejected(self):
+        self.f.control["epoch"] = 2
+        self.f.task["epoch"] = 3
+        self.f.write()
+        event = self.cancellation_event()
+        self.update([event], expected=1, diagnostic="epoch_stale")
+        bad = dict(event, runtime_id="invented")
+        self.update([self.inline_evidence(bad, observer="main")], expected=1, diagnostic="event_fields")
+
+    def test_cancel_unstarted_cli_uses_existing_preview_and_apply(self):
+        event = self.cancellation_event()
+        ref = self.f.put("撤销事件.json", {"events": [event]})
+        args = [sys.executable, "-I", "-B", str(SCRIPT), "--run", str(self.f.run), "--owner", "main",
+                "--expected-root-sha", self.digest(), "--events", str(self.f.run / ref["path"])]
+        before = self.root_path.read_bytes()
+        preview = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(preview.returncode, 0, preview.stdout)
+        self.assertEqual(json.loads(preview.stdout)["mode"], "preview")
+        self.assertEqual(before, self.root_path.read_bytes())
+        applied = subprocess.run(args[:4] + ["apply"] + args[4:], capture_output=True, text=True)
+        self.assertEqual(applied.returncode, 0, applied.stdout)
+        self.assertTrue(json.loads(applied.stdout)["applied"])
+        self.assertEqual(self.root()["harness_control"]["tasks"]["t1"]["status"], "stopped")
+
     def test_pure_reducer_does_not_mutate_input(self):
         root = self.root()
         event = self.event()
@@ -1121,8 +1489,10 @@ class MutationTests(unittest.TestCase):
         self.assertFalse((self.f.run / "状态.json.task-update.lock").exists())
 
     def test_readonly_gate_has_no_dependency_on_writer(self):
-        source = (BASE / "脚本" / "任务校验.py").read_text()
-        self.assertNotIn("任务变更", source)
+        source = ast.parse((BASE / "脚本" / "任务校验.py").read_text())
+        gate_imports = {alias.name for node in ast.walk(source) if isinstance(node, ast.Import) for alias in node.names}
+        gate_imports.update(node.module or "" for node in ast.walk(source) if isinstance(node, ast.ImportFrom))
+        self.assertFalse(any("任务变更" in name.split(".") for name in gate_imports))
         tree = ast.parse(SCRIPT.read_text())
         imports = {n.names[0].name for n in ast.walk(tree) if isinstance(n, ast.Import)}
         self.assertFalse(imports & {"requests", "urllib", "socket", "subprocess"})

@@ -137,6 +137,21 @@ def parse(data, label):
         raise GateError("json_invalid", label + ": " + str(e))
 
 
+def effective_pause(root, control):
+    """Return the dispatch/entry pause reasons, also used by the bounded inventory."""
+    status = root.get("status")
+    require(type(status) is str, "type", "root.status must be text")
+    paused = status.startswith("paused") or status in {"stopped", "suspended", "halted"}
+    require(paused or status in {"running", "active", "draining_existing_tasks"}, "run_status_unknown", status, "hold")
+    reasons = ["status:" + status] if paused or status == "draining_existing_tasks" else []
+    optimization = obj(root.get("harness_optimization_pause", {}), "harness_optimization_pause")
+    if flag(optimization.get("new_scientific_tasks_and_source_requests_paused", False), "optimization pause"):
+        reasons.append("harness_optimization_pause")
+    if flag(control.get("paused", False), "control.paused"):
+        reasons.append("harness_control.paused")
+    return reasons
+
+
 def resolve_path(path, *, strict=False):
     try:
         # Strict resolution detects loops even when non-strict resolve tolerates them.
@@ -229,8 +244,10 @@ class Checker:
         skill = resolve_path(Path(__file__)).parents[1]
         workspace = Path.home() / "research" / "机器人选题"
         return {str(skill / "SKILL.md"), str(skill / "配置.yaml"), str(skill / "脚本" / "任务校验.py"),
-                str(skill / "测试" / "任务校验测试.py"),
-                str(workspace / "AGENTS.md"), str(workspace / "判定标准.md")} | {
+                str(skill / "测试" / "任务校验测试.py"), str(skill / "参考" / "任务接口.md"),
+                str(skill / "脚本" / "任务变更.py"), str(skill / "测试" / "任务变更_测试.py"),
+                str(skill / "脚本" / "消息归档.py"), str(skill / "测试" / "消息归档测试.py"),
+                str(workspace / "AGENTS.md"), str(workspace / "判定标准.md"), str(workspace / "评审校准.md")} | {
                     str(workspace / "角色" / (name + ".md"))
                     for name in ("Leader", "组长", "调研人", "初筛人", "审稿人")}
 
@@ -341,6 +358,165 @@ class Checker:
         require(allowed, "output_escape", str(p))
         require(not p.exists() or p.is_dir(), "output_type", str(p))
 
+    def task_binding(self, task, record):
+        """Check shared envelope/record identity without inferring execution permission."""
+        obj(task, "task")
+        obj(record, "task record")
+        tid = text(task.get("task_id"), "task_id")
+        for field in ("agent_id", "stage"):
+            text(task.get(field), field)
+            require(record.get(field) == task[field], "route_mismatch", field)
+        require(record.get("status") in STATUSES, "task_status", tid)
+        for key in task:
+            if key in record and key not in {"schema_version", "status"}:
+                require(record[key] == task[key], "record_mismatch", key)
+
+    def material_target(self, task, raw):
+        """Bind both the declared spelling and resolved target to this task directory."""
+        self.output(task.get("output_dir"))
+        base_raw = self.absolute(task["output_dir"])
+        target_raw = self.absolute(raw)
+        require(".." not in target_raw.parts, "output_escape", str(target_raw))
+        base, target = self.path(task["output_dir"]), self.path(raw)
+        # Normalize only the RUN alias, retaining lexical containment inside the declared group.
+        def run_spelling(path):
+            try:
+                return self.run / path.relative_to(self.raw_run)
+            except ValueError:
+                return path
+        declared_base, declared_target = run_spelling(base_raw), run_spelling(target_raw)
+        try:
+            try:
+                declared_target.relative_to(declared_base)
+            except ValueError:
+                declared_target.relative_to(base)
+            target.relative_to(base)
+        except ValueError:
+            raise GateError("output_escape", "material must remain in this task output_dir")
+        require(target != base and target.suffix.lower() == ".md", "scientific_format", "Markdown target required")
+        return target
+
+    def local_capability(self, task, record, control, required, *, operation_only=False):
+        """Check declared local authority; real tool permission remains the caller's responsibility."""
+        scope = obj(task.get("task_scope"), "task_scope")
+        require(set(scope) <= {"allowed_actions", "allowed_stages", "limits"}, "scope_unknown_fields", "task_scope", "hold")
+        actions = set(strings(scope.get("allowed_actions"), "allowed_actions"))
+        require(actions <= ACTIONS, "action_unsupported", "local delivery task actions", "hold")
+        require(task["stage"] in strings(scope.get("allowed_stages"), "allowed_stages"), "scope_stage", task["stage"])
+        require(set(required) <= actions, "scientific_delivery_permission", "delivery needs " + ", ".join(sorted(required)), "hold")
+        limits, used = obj(scope.get("limits"), "limits"), obj(record.get("action_used", {}), "action_used")
+        for action, limit in limits.items():
+            require(action in actions, "scope_limit_action", action)
+            number(limit, "limit." + action)
+        for action, count in used.items():
+            require(action in actions, "scope_limit_action", action)
+            number(count, "action_used." + action)
+        for action in required:
+            if action in limits:
+                require(used.get(action, 0) < limits[action], "scope_exhausted", action)
+        permissions = obj(control.get("permissions"), "permissions")
+        allowed = set(strings(permissions.get("allowed_actions"), "allowed_actions"))
+        denied = set(strings(permissions.get("denied_actions"), "denied_actions"))
+        for reference in control.get("restriction_refs", []):
+            denied.update(strings(self.ref(reference, True).get("denied_actions"), "restriction.denied_actions"))
+        denied.update(self.inherited_refusals(task, control))
+        requested = set(required) if operation_only else actions
+        require(requested <= allowed and not requested & denied, "permission_denied", "delivery cannot elevate permissions")
+        return denied
+
+    def inherited_refusals(self, task, control):
+        denied = set()
+        ancestors = set(self.ancestors(task, control))
+        for tid, prior in control["tasks"].items():
+            obj(prior, "task record")
+            if prior.get("agent_id") == task["agent_id"] and tid != task["task_id"]:
+                historical = self.ref(prior.get("ref"), True)
+                require(historical.get("task_id") == tid and historical.get("agent_id") == prior.get("agent_id")
+                        and historical.get("stage") == prior.get("stage"), "route_mismatch", tid)
+                ancestors.update(self.ancestors(historical, control))
+        for tid, prior in control["tasks"].items():
+            if prior.get("agent_id") == task["agent_id"] or tid in ancestors:
+                denied.update(strings(prior.get("refusal_actions", []), "refusal_actions"))
+        return denied
+
+    def archive_actor_available(self, task, record, root):
+        """Reject an impossible delivery route without reserving unrelated generation budget."""
+        tid = task["task_id"]
+        require("unstarted_cancellation" not in record, "task_cancelled", tid)
+        control = root["harness_control"]
+        ancestors = self.ancestors(task, control)
+        for old_id, old in control["tasks"].items():
+            if old_id == tid or old.get("agent_id") != task["agent_id"]:
+                continue
+            previous = self.ref(old.get("ref"), True)
+            require(previous.get("task_id") == old_id and previous.get("agent_id") == old.get("agent_id")
+                    and previous.get("stage") == old.get("stage"), "route_mismatch", old_id)
+            if "unstarted_cancellation" in old:
+                self.unstarted_cancelled(old_id, old, root.get("total_leader"))
+                continue
+            require(old.get("status") in {"completed", "failed", "stopped"}, "agent_busy", old_id)
+            if old["status"] == "completed":
+                self.facts(old)
+                self.scientific(previous, old, preserve_existing=True)
+            else:
+                require(old.get("runtime_state") == "stopped" and old.get("runtime_id") is not None and
+                        old.get("stop_receipt_ref") is not None, "stop_evidence_missing", old_id, "hold")
+                self.stopped(old_id, old)
+                if old.get("failure_id"):
+                    require(old_id in ancestors or self.resolved_failure(old_id, control),
+                            "recovery_missing", "archive actor has unresolved failed work")
+
+    def delivery_route(self, task, record, delivery, *, admission=False, preserving=False):
+        plan = delivery.get("delivery_plan")
+        if plan is None:
+            if admission:
+                root = parse(self.read(self.raw_run / "状态.json"), "root")
+                self.local_capability(task, record, root["harness_control"], {"generate_local", "preserve_local"})
+            return None
+        obj(plan, "delivery_plan")
+        mode = plan.get("mode")
+        require(mode in {"direct", "delegated-archive"}, "delivery_plan_mode", "direct or delegated-archive required")
+        fields = {"mode", "target"} | ({"archive_task_id", "archive_agent_id"} if mode == "delegated-archive" else set())
+        require(set(plan) == fields, "delivery_plan_fields", "exact delivery plan fields required")
+        target = self.material_target(task, text(plan.get("target"), "delivery_plan.target"))
+        if mode == "delegated-archive":
+            tid = text(plan.get("archive_task_id"), "archive_task_id")
+            agent = text(plan.get("archive_agent_id"), "archive_agent_id")
+            require(tid != task["task_id"], "archive_owner", "delegated archive requires another registered task")
+            require(agent == delivery["reader_id"], "archive_owner", "archive actor must be the receiving group owner")
+        if not admission:
+            return {"mode": mode, "target": target}
+        root = parse(self.read(self.raw_run / "状态.json"), "root")
+        control = obj(root.get("harness_control"), "harness_control")
+        actor_task, actor_record = task, record
+        require("unstarted_cancellation" not in record, "task_cancelled", task["task_id"])
+        if mode == "delegated-archive":
+            actor_record = obj(control["tasks"].get(tid), "archive task record")
+            actor_task = self.ref(actor_record.get("ref"), True)
+            require(actor_task.get("schema_version") == 1 and type(actor_task["schema_version"]) is int,
+                    "task_schema", "archive task v1 required")
+            require(actor_task.get("task_id") == tid and actor_task.get("agent_id") == actor_record.get("agent_id") == agent
+                    and actor_task.get("stage") == actor_record.get("stage"), "route_mismatch", "archive task")
+            self.task_binding(actor_task, actor_record)
+            number(actor_task.get("epoch"), "archive_task.epoch")
+            require(actor_task.get("run_id") == self.run.name and actor_task.get("epoch") == control["epoch"],
+                    "epoch_stale", "archive task")
+            require(actor_record.get("status") in {"registered", "delivered", "accepted", "started"},
+                    "archive_task_terminal", tid)
+            require(self.absolute(actor_task.get("output_dir")) == self.absolute(task["output_dir"])
+                    and self.path(actor_task["output_dir"]) == self.path(task["output_dir"]),
+                    "archive_owner", "archive task must own the same declared group directory")
+            self.ref(actor_task.get("role_ref"), norm=True)
+            self.refs(actor_task.get("input_refs"), "archive.input_refs")
+            self.facts(actor_record)
+            self.archive_actor_available(actor_task, actor_record, root)
+        required = {"read_local", "preserve_local"} if mode == "delegated-archive" or preserving else {"generate_local", "preserve_local"}
+        if mode == "delegated-archive":
+            require(not self.inherited_refusals(task, control) & required,
+                    "permission_denied", "delegation cannot retry the author's refused action")
+        self.local_capability(actor_task, actor_record, control, required, operation_only=preserving)
+        return {"mode": mode, "target": target, "task": actor_task, "record": actor_record}
+
     def delivery_facts(self, delivery, label="output_delivery"):
         obj(delivery, label)
         text(delivery.get("version"), label + ".version")
@@ -387,7 +563,7 @@ class Checker:
                 require("formed_at" in times and "material_ref" in record,
                         "delivery_fact_missing", "legacy completed needs formed_at and material_ref")
 
-    def scientific(self, task, record):
+    def scientific(self, task, record, *, admission=False, preserve_existing=False):
         if "scientific_work_ref" not in task:
             return  # Existing input JSON may already contain unrelated scientific_work data.
         ref = obj(task["scientific_work_ref"], "scientific_work_ref")
@@ -410,12 +586,17 @@ class Checker:
         require(delivery.get("format") == "markdown", "scientific_format", "markdown required")
         text(delivery.get("version"), "deliverable.version")
         text(delivery.get("reader_id"), "deliverable.reader_id")
+        route = self.delivery_route(task, record, delivery, admission=admission)
         output = record.get("output_delivery")
         if output is not None:
             self.delivery_facts(output)
             require(output["version"] == delivery["version"], "output_version", "version differs from contract")
             material = self.ref(output["material_ref"])
             require(material.suffix.lower() == ".md", "scientific_format", "readable Markdown artifact required")
+            if route is not None or admission or not preserve_existing:
+                self.material_target(task, output["material_ref"]["path"])
+            if route is not None:
+                require(material == route["target"], "output_target", "material differs from declared delivery target")
             require(bool(self.read(material).decode("utf-8").strip()), "scientific_empty", "empty deliverable")
             if "reader_id" in output:
                 require(output["reader_id"] == delivery["reader_id"], "output_reader", "wrong recipient")
@@ -461,6 +642,75 @@ class Checker:
                 other = self.ref(record.get("ref"), True)
                 require(other.get("recovery_of") != rec, "recovery_replay", tid)
         self.stopped(old_id, prior)
+
+    def unstarted_cancelled(self, tid, record, owner):
+        """Verify positive non-dispatch evidence, never infer it from absent runtime fields."""
+        marker = obj(record.get("unstarted_cancellation"), "unstarted_cancellation")
+        require(set(marker) == {"receipt_ref", "cancelled_at"}, "unstarted_receipt_invalid", "cancellation marker fields")
+        ref = obj(record.get("ref"), "task.ref")
+        task = self.ref(ref, True)
+        receipt = self.ref(marker["receipt_ref"], True)
+        expected = {"schema_version": 1, "run_id": self.run.name, "task_id": tid,
+                    "task_sha256": ref["sha256"], "epoch": task.get("epoch"),
+                    "agent_id": record.get("agent_id"), "stage": record.get("stage"),
+                    "status": "not_started", "success": True, "confirmed_by": text(owner, "owner"),
+                    "delivery_enqueued": False, "delivered": False, "accepted": False,
+                    "started": False, "pending_delivery": False, "source_actions_executed": 0}
+        require(set(receipt) == set(expected) | {"cancelled_at", "dispatch_check_report", "observation"},
+                "unstarted_receipt_invalid", "receipt fields")
+        require(all(type(receipt.get(k)) is type(v) and receipt[k] == v for k, v in expected.items()),
+                "unstarted_receipt_invalid", "receipt task, owner or execution binding differs")
+        require(task.get("schema_version") == 1 and type(task["schema_version"]) is int and
+                task.get("run_id") == self.run.name and task.get("task_id") == tid and
+                task.get("agent_id") == record.get("agent_id") and task.get("stage") == record.get("stage"),
+                "route_mismatch", tid)
+        number(task.get("epoch"), "task.epoch")
+        if not hasattr(self, "_cancellation_epoch"):
+            current = obj(parse(self.read(self.raw_run / "状态.json"), "root").get("harness_control"), "harness_control")
+            self._cancellation_epoch = number(current.get("epoch"), "epoch")
+        require(0 < task["epoch"] <= self._cancellation_epoch, "epoch_stale", tid)
+        when = timestamp(receipt.get("cancelled_at"), "cancelled_at")
+        require(when == timestamp(marker.get("cancelled_at"), "cancelled_at"), "unstarted_receipt_invalid", "cancellation time differs")
+        observation = obj(receipt.get("observation"), "observation")
+        require(set(observation) == {"kind", "id", "observer_id", "observed_at"} and
+                observation.get("kind") in {"message", "tool"} and observation.get("observer_id") == owner,
+                "unstarted_receipt_invalid", "root owner observation required")
+        text(observation.get("id"), "observation.id")
+        require(timestamp(observation.get("observed_at"), "observed_at") >= when,
+                "event_order", "observation precedes cancellation")
+        report = obj(receipt.get("dispatch_check_report"), "dispatch_check_report")
+        require(report.get("ok") is False and report.get("decision") in {"fail", "hold"} and
+                report.get("phase") == "dispatch" and report.get("task_id") == tid and
+                type(report.get("diagnostics")) is list and any(type(d) is dict and
+                    d.get("level") in {"error", "hold"} and type(d.get("code")) is str and d["code"]
+                    for d in report["diagnostics"]), "unstarted_receipt_invalid", "failed task dispatch evidence required")
+        require("dispatch_check_report" not in record or record["dispatch_check_report"] == report,
+                "unstarted_conflict", "recorded dispatch report differs")
+        if "dispatch_checked_at_utc" in record:
+            require(timestamp(record["dispatch_checked_at_utc"], "dispatch_checked_at_utc") <= when,
+                    "event_order", "cancellation precedes dispatch rejection")
+        require(record.get("status") in {"registered", "stopped"} and "failure_id" not in record,
+                "unstarted_conflict", "only never-started registered or administrative stopped tasks may be cancelled")
+        forbidden = {"delivery_enqueued_at", "delivered_at", "accepted_at", "started_at", "runtime_id",
+                     "entry_receipt", "entry_receipt_ref", "stop_receipt_ref", "output_delivery"}
+        require(not forbidden.intersection(record) and record.get("runtime_state") in (None, "unknown"),
+                "unstarted_conflict", "known delivery, execution or output fact exists")
+        for key in ("actor_started_or_delivered", "delivery_enqueued", "delivered", "accepted", "started", "pending_delivery", "source_actions_executed"):
+            value = 0 if key == "source_actions_executed" else False
+            require(key not in record or (type(record[key]) is type(value) and record[key] == value),
+                    "unstarted_conflict", key)
+        for key, value in obj(record.get("action_used", {}), "action_used").items():
+            require(number(value, key) == 0, "unstarted_conflict", "recorded action was executed: " + key)
+        for value in obj(record.get("lifecycle_events", {}), "lifecycle_events").values():
+            require(obj(value.get("event"), "lifecycle event").get("type") in {"register", "cancel_unstarted"},
+                    "unstarted_conflict", "recorded lifecycle execution fact exists")
+        if "material_ref" in record:
+            material = obj(record["material_ref"], "material_ref")
+            require(material.get("sha256") == ref["sha256"] and self.ref(material) == self.ref(ref),
+                    "unstarted_conflict", "only the preparation envelope may be a legacy material")
+        require(re.sub(r"[^a-z0-9]", "", observation["id"].lower()) not in {"notaskfound", "failedjson"},
+                "unstarted_receipt_invalid", "a bare error label is not a positive non-dispatch observation")
+        return receipt
 
     def stopped(self, old_id, prior):
         require(prior.get("runtime_state") == "stopped", "runtime_not_stopped", old_id)
@@ -912,28 +1162,17 @@ class Checker:
         require(control["epoch"] > 0, "epoch", "epoch must be positive")
         number(task.get("epoch"), "task.epoch")
         require(task["epoch"] == control["epoch"], "epoch_stale", self.task_id)
-        status = root.get("status")
-        require(type(status) is str, "type", "root.status must be text")
-        paused = status.startswith("paused") or status in {"stopped", "suspended", "halted"}
-        require(paused or status in {"running", "active", "draining_existing_tasks"}, "run_status_unknown", status, "hold")
-        pause = obj(root.get("harness_optimization_pause", {}), "harness_optimization_pause")
-        for value, label in ((pause.get("new_scientific_tasks_and_source_requests_paused", False), "optimization pause"),
-                             (control.get("paused", False), "control.paused")):
-            paused = flag(value, label) or paused
-        if (paused or status == "draining_existing_tasks") and self.phase != "checkpoint":
+        if effective_pause(root, control) and self.phase != "checkpoint":
             raise GateError("run_paused", "dispatch and entry remain paused")
         if self.phase == "checkpoint":
             self.notice("preserve_only", "checkpoint does not authorize dispatch, sources or resumed work")
         tasks = obj(control.get("tasks"), "tasks")
         record = obj(tasks.get(self.task_id), "registered task")
         require(self.ref(record.get("ref")) == self.task_path, "task_ref_path", self.task_id)
-        for field in ("agent_id", "stage"):
-            text(task.get(field), field)
-            require(record.get(field) == task[field], "route_mismatch", field)
-        require(record.get("status") in STATUSES, "task_status", self.task_id)
-        for k in task:
-            if k in record and k not in {"schema_version", "status"}:
-                require(record[k] == task[k], "record_mismatch", k)
+        self.task_binding(task, record)
+        if "unstarted_cancellation" in record:
+            self.unstarted_cancelled(self.task_id, record, root.get("total_leader"))
+            require(self.phase == "checkpoint", "task_cancelled", self.task_id)
         self.ref(task.get("role_ref"), norm=True)
         inputs = task.get("input_refs")
         require(type(inputs) is list, "type", "input_refs must be an array")
@@ -988,18 +1227,28 @@ class Checker:
             if old.get("agent_id") == task["agent_id"] or tid in permission_ancestors:
                 denied.update(strings(old.get("refusal_actions", []), "refusal_actions"))
             if tid != self.task_id and old.get("agent_id") == task["agent_id"]:
-                if self.phase != "checkpoint":
+                cancelled = "unstarted_cancellation" in old
+                if cancelled:
+                    self.unstarted_cancelled(tid, old, root.get("total_leader"))
+                if self.phase != "checkpoint" and not cancelled:
                     require(old.get("status") in {"completed", "stopped", "failed"}, "agent_busy", tid)
                     if old["status"] in {"failed", "stopped"}:
                         if old.get("runtime_state") not in {None, "unknown"}:
                             require(old["runtime_state"] == "stopped", "runtime_not_stopped", tid)
-                        require(old.get("runtime_state") not in {None, "unknown"} and old.get("runtime_id") is not None and
-                                old.get("stop_receipt_ref") is not None, "stop_evidence_missing", tid, "hold")
+                        if (old.get("runtime_state") in {None, "unknown"} or old.get("runtime_id") is None or
+                                old.get("stop_receipt_ref") is None):
+                            self.execution_blocker = {
+                                "task_id": tid, "agent_id": old.get("agent_id"), "task_ref": old.get("ref"),
+                                "recorded_runtime_id": old.get("runtime_id"),
+                                "required_evidence": ["A real stop receipt bound to the original task, agent and runtime.",
+                                    "For a rejected, never-dispatched preparation only: cancel_unstarted with positive non-dispatch evidence."],
+                                "unknown_is_not_evidence": True}
+                            raise GateError("stop_evidence_missing", tid, "hold")
                         self.stopped(tid, old)
                     else:
                         try:
                             self.facts(old)
-                            self.scientific(historical_tasks[tid], old)
+                            self.scientific(historical_tasks[tid], old, preserve_existing=True)
                         except GateError as error:
                             if error.code in {"delivery_fact_missing", "scientific_delivery_missing"}:
                                 raise GateError(error.code, tid + ": " + error.detail, "hold")
@@ -1009,7 +1258,8 @@ class Checker:
                             "recovery_missing", "unresolved failed logical task needs registered recovery")
         require(set(actions) <= set(allowed) and not (set(actions) & denied), "permission_denied", "scope cannot elevate permissions")
         self.facts(record)
-        self.scientific(task, record)
+        self.scientific(task, record, admission=self.phase != "checkpoint",
+                        preserve_existing=self.phase == "checkpoint")
         if self.phase == "dispatch":
             require(record["status"] == "registered" and "delivered_at" not in record, "task_replay", self.task_id)
         elif self.phase == "entry":
@@ -1058,6 +1308,8 @@ def check_task(run, task, phase, *, checkpoint_archive_ref=None):
               "diagnostics": (checker.diagnostics if checker else []) + diagnostics}
     if checker is not None:
         result["task_id"] = checker.task_id
+    if checker is not None and getattr(checker, "execution_blocker", None):
+        result["execution_blocker"] = checker.execution_blocker
     if checker is not None and checker.archive_used:
         result["checkpoint_archive"] = checker.archive_used
     if code == 0 and phase == "entry":
@@ -1108,11 +1360,13 @@ def inspect_run(run, task=None, status=None, agent=None, limit=20, cursor=None):
                 return None
             return {k: short(value.get(k)) for k in ("path", "sha256")}
 
+        pause_reasons = effective_pause(root, control)
         result = {"ok": True, "action_permission": False, "root_sha256": root_sha,
                   "snapshot": None, "total": len(ids), "truncated": False, "next_cursor": None,
                   "control": {"status": short(root.get("status")), "paused": short(control.get("paused")),
                               "epoch": short(control.get("epoch")), "goal_met": short(root.get("goal_met")),
-                              "owner": short(root.get("total_leader"))}, "tasks": []}
+                              "owner": short(root.get("total_leader")), "effective_paused": bool(pause_reasons),
+                              "pause_reasons": pause_reasons}, "tasks": []}
         for tid in ids[offset:offset + limit]:
             row = obj(tasks[tid], "task record")
             envelope = c.ref(row.get("ref"), True)
@@ -1128,11 +1382,30 @@ def inspect_run(run, task=None, status=None, agent=None, limit=20, cursor=None):
                     "output_version": short(output.get("version")) if type(output) is dict else None,
                     "missing_sections": [short(v) for v in missing[:4]] if type(missing) is list else [],
                     "missing_sections_total": len(missing) if type(missing) is list else None}
+            scope = envelope.get("task_scope", {})
+            actions = scope.get("allowed_actions", []) if type(scope) is dict else []
+            source_work = type(actions) is list and any(type(a) is str and a in {"source_get", "source_query", "read_cache"} for a in actions)
+            item["work_kind"] = "scientific" if envelope.get("scientific_work_ref") else "source" if source_work else "administrative_or_legacy"
+            output_facts = output if type(output) is dict else {}
+            marker = row.get("unstarted_cancellation", {})
+            item["recorded_facts"] = {
+                "delivered_at": short(row.get("delivered_at")), "accepted_at": short(row.get("accepted_at")),
+                "started_at": short(row.get("started_at")), "output_formed_at": short(output_facts.get("formed_at")),
+                "output_delivered_at": short(output_facts.get("delivered_at")),
+                "archived_at": short(output_facts.get("archived_at")), "read_at": short(output_facts.get("read_at")),
+                "runtime_state": short(row.get("runtime_state")), "runtime_id": short(row.get("runtime_id")),
+                "stop_receipt_ref": brief_ref(row.get("stop_receipt_ref")),
+                "unstarted_cancelled_at": short(marker.get("cancelled_at")) if type(marker) is dict else None}
             result["tasks"].append(item)
             # Reserve enough space for the continuation token and snapshot metadata.
             if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > INSPECT_BYTES - 2200:
                 result["tasks"].pop()
                 break
+        science = [item for item in result["tasks"] if item["work_kind"] == "scientific"]
+        result["progress"] = {"scope": "returned_tasks_only", "physical_activity": "not_checked",
+                              "scientific_task_records": len(science),
+                              "scientific_started_records": sum(item["recorded_facts"]["started_at"] is not None for item in science),
+                              "scientific_output_records": sum(item["output_ref"] is not None for item in science)}
         advanced = offset + len(result["tasks"])
         result["truncated"] = advanced < len(ids)
         if result["truncated"]:

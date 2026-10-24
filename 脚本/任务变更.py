@@ -30,7 +30,8 @@ FIELDS = {"register": {"task_ref"}, "input_observed": {"status"},
           "cancel_unstarted": {"unstarted_receipt_ref"}}
 TERMINAL = {"completed", "failed", "stopped"}
 OUTPUT_FIELDS = {"material_ref", "version", "formed_at", "delivered_at", "archived_at", "read_at",
-                 "reader_id", "read_version", "read_material_ref"}
+                 "reader_id", "read_version", "read_material_ref", "message_ref", "read_message_ref",
+                 "retained_at", "received_at", "producer_receipt_ref", "read_receipt_ref"}
 
 
 def sha(data):
@@ -83,13 +84,17 @@ def legacy_output(record, output, observation):
             gate.require(record["read_material_ref"] == output.get("read_material_ref"), "output_conflict", "legacy read original differs")
 
 
+def output_identity(output):
+    return (output.get("version"), output.get("material_ref"), output.get("message_ref"))
+
+
 def preserves_existing_output(checker, prior, output):
     """Recognize only an original already held by the committed root snapshot."""
     if type(prior) is not dict or type(output) is not dict:
         return False
     previous = prior.get("output_delivery")
     if type(previous) is dict:
-        return all(k in previous and k in output and previous[k] == output[k] for k in ("material_ref", "version"))
+        return output_identity(previous) == output_identity(output)
     if "output_delivery" in prior or prior.get("status") != "completed":
         return False
     if not all(k in prior for k in ("material_ref", "formed_at", "delivered_at")):
@@ -185,9 +190,10 @@ def reduce_events(root, events, observations, recorded_at):
                 if row["status"] == "completed" and previous is None:
                     legacy_output(row, output, observation)
                 if previous is not None:
-                    gate.require(type(previous) is dict and all(k in previous for k in ("material_ref", "version", "formed_at")),
+                    gate.require(type(previous) is dict and all(k in previous for k in ("version", "formed_at")) and
+                                 (("material_ref" in previous) != ("message_ref" in previous)),
                                  "output_contract_unknown", "existing structured output contract is incomplete", "hold")
-                    same = all(previous.get(k) == output.get(k) for k in ("version", "material_ref"))
+                    same = output_identity(previous) == output_identity(output)
                     if same:
                         gate.require(all(k in output and output[k] == v for k, v in previous.items()),
                                      "output_conflict", "same artifact facts are append-only")
@@ -199,11 +205,16 @@ def reduce_events(root, events, observations, recorded_at):
                 saved = checkpoint.get("saved_refs")
                 gate.require(type(saved) is list, "type", "checkpoint.saved_refs must be an array")
                 gate.strings(checkpoint.get("missing_sections"), "checkpoint.missing_sections")
-                if output["material_ref"] not in saved:
+                if "material_ref" in output and output["material_ref"] not in saved:
                     saved.append(copy.deepcopy(output["material_ref"]))
+                if "message_ref" in output:
+                    messages = checkpoint.setdefault("saved_messages", [])
+                    gate.require(type(messages) is list, "type", "saved_messages must be an array")
+                    if output["message_ref"] not in messages:
+                        messages.append(copy.deepcopy(output["message_ref"]))
                 # A completed scientific artifact is immutable; late missing receipt facts may be appended.
                 if row["status"] == "completed" and previous:
-                    gate.require(all(previous.get(k) == output.get(k) for k in ("version", "material_ref")),
+                    gate.require(output_identity(previous) == output_identity(output),
                                  "task_terminal", "completed output artifact cannot be replaced")
             elif kind == "complete":
                 gate.require(row["status"] == "started", "event_order", "completion needs actual start")
@@ -273,16 +284,19 @@ def observe(root, events, checker, root_sha, owner, original_tasks):
         if row is not None and "checkpoint" in row:
             checkpoint = gate.obj(row["checkpoint"], "checkpoint")
             checker.refs(checkpoint.get("saved_refs"), "checkpoint.saved_refs")
+            for original in checkpoint.get("saved_messages", []):
+                checker.message_ref(original)
         ref = event.get("task_ref") if kind == "register" else (row or {}).get("ref")
         task = checker.ref(ref, True)
         gate.require(task.get("schema_version") == 1 and type(task["schema_version"]) is int,
                      "task_schema", "v1 task required")
+        mapping = checker.protocol_mapping(task, row or {}) if not administrative_preservation(event) else None
         if administrative_preservation(event):
             gate.require(task.get("run_id") == checker.run.name, "run_id", "task run differs")
             gate.number(task.get("epoch"), "task.epoch")
             gate.require(0 < task["epoch"] <= control["epoch"], "epoch_stale", "administrative preservation requires an existing task epoch")
         else:
-            gate.require(task.get("run_id") == checker.run.name and task.get("epoch") == control.get("epoch"),
+            gate.require(task.get("run_id") == checker.run.name and (task.get("epoch") == control.get("epoch") or mapping is not None),
                          "epoch_stale", "task run/epoch differs")
         for field in ("task_id", "agent_id", "stage"):
             gate.require(task.get(field) == event.get(field), "route_mismatch", field)
@@ -313,6 +327,8 @@ def observe(root, events, checker, root_sha, owner, original_tasks):
         checker.ref(task.get("role_ref"))
         checker.refs(task.get("input_refs"), "input_refs")
         checker.output(task.get("output_dir"))
+        for original in task.get("message_input_refs", []):
+            checker.message_ref(original)
         if kind == "register":
             gate.require("recovery_of" not in task, "recovery_unsupported", "recovery routing requires owner review outside this tool")
             scope = gate.obj(task.get("task_scope"), "task_scope")
@@ -335,7 +351,7 @@ def observe(root, events, checker, root_sha, owner, original_tasks):
             receipt = (checker.ref(event["entry_receipt_ref"], True) if "entry_receipt_ref" in event
                        else gate.obj(event["entry_receipt"], "entry_receipt"))
             expected = {"task_id": tid, "agent_id": task["agent_id"], "stage": task["stage"], "phase": "entry",
-                        "decision": "allow", "ok": True, "epoch": task["epoch"], "task_sha256": ref["sha256"]}
+                        "decision": "allow", "ok": True, "epoch": control["epoch"], "task_sha256": ref["sha256"]}
             gate.require(all(type(receipt.get(k)) is type(v) and receipt[k] == v for k, v in expected.items()),
                          "entry_receipt_invalid", "entry receipt binding differs")
             gate.require(type(receipt.get("root_sha256")) is str and
@@ -408,6 +424,8 @@ def prepare(run, owner, expected_root_sha, events, recorded_at):
         checker.facts(row)
         if "checkpoint" in row:
             checker.refs(gate.obj(row["checkpoint"], "checkpoint").get("saved_refs"), "checkpoint.saved_refs")
+            for saved_message in row["checkpoint"].get("saved_messages", []):
+                checker.message_ref(saved_message)
         task_events = [e for e in events if e["task_id"] == tid]
         if any(not administrative_preservation(e) for e in task_events):
             preserve = preserves_existing_output(checker, control["tasks"].get(tid), row.get("output_delivery"))

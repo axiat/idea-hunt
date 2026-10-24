@@ -20,6 +20,9 @@ import hashlib
 import io
 import json
 import math
+import os
+import stat
+import uuid
 import re
 import sys
 import zipfile
@@ -31,7 +34,7 @@ ACTIONS = {"read_local", "preserve_local", "generate_local", "read_cache",
 COUNTERS = {"initial_get", "normal_location", "query"}
 STATUSES = {"registered", "delivered", "accepted", "started", "completed",
             "failed", "stopped"}
-FACTS = ("formed_at", "delivered_at", "archived_at", "read_at")
+FACTS = ("formed_at", "delivered_at", "archived_at", "retained_at", "received_at", "read_at")
 PHASES = {"dispatch", "entry", "checkpoint"}
 INSPECT_BYTES = 12288
 
@@ -178,6 +181,9 @@ class Checker:
         self.absent = set()  # Missing norm files used only by explicit archive preservation.
         self.archive = None
         self.archive_used = []
+        self.message_reads = {}
+        self.protocol = None
+        self.protocol_norms = set()
         self.raw_run = Path(run).absolute()
         self.run = self.bind(self.raw_run)
         require(self.run.is_dir(), "file_missing", str(self.raw_run), "hold")
@@ -218,6 +224,8 @@ class Checker:
         return data
 
     def recheck(self, root_conflict=False):
+        for source, author, reader, identity in list(self.message_reads.values()):
+            self.native_message(source, author, reader, expected_identity=identity)
         for raw, target in self.bindings.items():
             require(resolve_path(raw) == target, "path_changed", str(raw))
         for path in self.absent:
@@ -231,6 +239,9 @@ class Checker:
     def merge(self, other):
         require(not (self.absent & set(other.snapshots)) and not (other.absent & set(self.snapshots)),
                 "file_changed", "file presence changed between read sets")
+        for key, value in other.message_reads.items():
+            require(key not in self.message_reads or self.message_reads[key] == value, "message_changed", "nested message observation differs")
+            self.message_reads[key] = value
         self.absent.update(other.absent)
         for raw, target in other.bindings.items():
             require(raw not in self.bindings or self.bindings[raw] == target, "path_changed", str(raw))
@@ -243,13 +254,13 @@ class Checker:
     def norm_sources():
         skill = resolve_path(Path(__file__)).parents[1]
         workspace = Path.home() / "research" / "机器人选题"
-        return {str(skill / "SKILL.md"), str(skill / "配置.yaml"), str(skill / "脚本" / "任务校验.py"),
-                str(skill / "测试" / "任务校验测试.py"), str(skill / "参考" / "任务接口.md"),
-                str(skill / "脚本" / "任务变更.py"), str(skill / "测试" / "任务变更_测试.py"),
-                str(skill / "脚本" / "消息归档.py"), str(skill / "测试" / "消息归档测试.py"),
-                str(workspace / "AGENTS.md"), str(workspace / "判定标准.md"), str(workspace / "评审校准.md")} | {
-                    str(workspace / "角色" / (name + ".md"))
-                    for name in ("Leader", "组长", "调研人", "初筛人", "审稿人")}
+        homes = {skill, Path.home() / ".agents/skills/idea-hunt", Path.home() / ".claude/skills/idea-hunt"}
+        files = ("SKILL.md", "配置.yaml", "参考/任务接口.md", "脚本/任务校验.py", "脚本/任务变更.py",
+                 "脚本/消息归档.py", "测试/任务校验测试.py", "测试/任务变更_测试.py", "测试/消息归档测试.py")
+        return {str(home / name) for home in homes for name in files} | {
+            str(workspace / name) for name in ("AGENTS.md", "判定标准.md", "评审校准.md")
+        } | {str(workspace / "角色" / (name + ".md"))
+             for name in ("Leader", "组长", "调研人", "初筛人", "审稿人")}
 
     def load_archive(self, ref):
         obj(ref, "checkpoint_archive_ref")
@@ -314,7 +325,7 @@ class Checker:
             data = self.read(p)
             require(hashlib.sha256(data).hexdigest() == sha, "hash_mismatch", str(p))
         except GateError as error:
-            if not (norm and self.archive is not None and error.code in {"hash_mismatch", "file_missing"}):
+            if not (((norm and not self.protocol_norms) or str(raw) in self.protocol_norms) and self.archive is not None and error.code in {"hash_mismatch", "file_missing"}):
                 raise
             source = str(raw)  # Exact spelling, deliberately not resolve() or target-path matching.
             require(source in self.norm_sources() and source in self.archive["entries"], "archive_norm_unknown", source)
@@ -396,6 +407,142 @@ class Checker:
         require(target != base and target.suffix.lower() == ".md", "scientific_format", "Markdown target required")
         return target
 
+    def native_message(self, source, author, reader, *, expected_identity=None):
+        """Verify a complete native SendMessage leaf, including the native sender identity."""
+        obj(source, "message source")
+        required = {"path", "line", "record_uuid", "pointer", "raw_line_sha256", "payload_bytes",
+                    "payload_sha256", "utf8_start", "utf8_end", "tool_use_id"}
+        require(required <= set(source) and set(source) <= required | {"task_id", "author_id", "version"},
+                "message_source_fields", "exact native locator fields required")
+        path = Path(text(source["path"], "message path"))
+        require(path.is_absolute() and self.bind(path) == path, "message_source_path", "canonical absolute path required")
+        root = parse(self.read(self.raw_run / "状态.json"), "root")
+        bindings = obj(root["harness_control"].get("native_message_bindings", {}), "native_message_bindings")
+        paths = bindings.get(author)
+        require(type(paths) is list and str(path) in paths, "native_message_binding_missing",
+                "root owner must bind this actual actor to its observed native transcript path", "hold")
+        line = number(source["line"], "line")
+        require(0 < line <= 1000000, "message_size", "bounded line number required")
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            require(stat.S_ISREG(info.st_mode), "message_source_type", "regular native log required")
+            identity = (info.st_dev, info.st_ino)
+            require(expected_identity is None or identity == expected_identity, "message_changed", "native log replaced")
+            offset, current, length, pieces, done = 0, 1, 0, [], False
+            while True:
+                block = os.pread(fd, 65536, offset)
+                require(bool(block), "message_line_missing", "complete LF-terminated record required", "hold")
+                offset += len(block)
+                start = 0
+                while start < len(block):
+                    newline = block.find(b"\n", start)
+                    end = newline + 1 if newline >= 0 else len(block)
+                    length += end - start
+                    require(length <= 2097152, "message_size", "record exceeds 2 MiB")
+                    if current == line:
+                        pieces.append(block[start:end])
+                    if newline >= 0:
+                        if current == line:
+                            done = True
+                            break
+                        current += 1
+                        length = 0
+                    start = end
+                if done:
+                    break
+            raw = b"".join(pieces)
+        finally:
+            os.close(fd)
+        require(hashlib.sha256(raw).hexdigest() == source["raw_line_sha256"], "message_record_hash", "native record changed")
+        record = parse(raw, "native message")
+        identifier = text(source["record_uuid"], "record_uuid")
+        require(str(uuid.UUID(identifier)) == identifier and uuid.UUID(identifier).int != 0 and
+                record.get("uuid") == identifier, "message_uuid", "canonical matching non-null UUID required")
+        require(record.get("agentId") == author, "message_sender", "native sender differs or is missing")
+        require(record.get("type") == "assistant" and record.get("message", {}).get("role") == "assistant" and
+                not flag(record.get("isApiErrorMessage", False), "isApiErrorMessage"), "message_role", "real assistant message required")
+        match = re.fullmatch(r"/message/content/(0|[1-9][0-9]*)/input/message", source["pointer"])
+        require(match is not None, "message_pointer", "complete SendMessage leaf required")
+        blocks = record["message"]["content"]
+        require(type(blocks) is list and int(match[1]) < len(blocks), "message_pointer", "tool block absent")
+        block = obj(blocks[int(match[1])], "message block")
+        require(block.get("type") == "tool_use" and block.get("name") == "SendMessage" and
+                block.get("id") == source["tool_use_id"], "message_block", "exact SendMessage tool binding required")
+        inputs = obj(block.get("input"), "SendMessage input")
+        require(inputs.get("to") == reader, "message_recipient", "actual recipient differs")
+        value = text(inputs.get("message"), "full message")
+        payload = value.encode("utf-8")
+        require("\x00" not in value and 0 < len(payload) <= 1048576, "message_size", "nonempty bounded UTF-8 body required")
+        require(type(source["utf8_start"]) is int and type(source["utf8_end"]) is int and
+                source["utf8_start"] == 0 and source["utf8_end"] == len(payload), "message_range", "whole body required")
+        require(type(source["payload_bytes"]) is int and source["payload_bytes"] == len(payload) and
+                source["payload_sha256"] == hashlib.sha256(payload).hexdigest(), "message_payload_hash", "payload fingerprint differs")
+        key = (str(path), line)
+        observation = (dict(source), author, reader, identity)
+        require(key not in self.message_reads or self.message_reads[key] == observation, "message_changed", "message binding changed")
+        self.message_reads[key] = observation
+        return value
+
+    def message_ref(self, reference):
+        obj(reference, "message_ref")
+        require(set(reference) == {"source", "author_id", "reader_id", "task_id", "version"},
+                "message_ref_fields", "complete delivery identity required")
+        for key in ("author_id", "reader_id", "task_id", "version"):
+            text(reference[key], key)
+        for key, field in (("author_id", "author_id"), ("task_id", "task_id"), ("version", "version")):
+            if field in reference["source"]:
+                require(reference["source"][field] == reference[key], "message_declaration", field)
+        return self.native_message(reference["source"], reference["author_id"], reference["reader_id"])
+
+    def protocol_mapping(self, task, record):
+        root = parse(self.read(self.raw_run / "状态.json"), "root")
+        control = root["harness_control"]
+        if "delivery_protocol_ref" not in control:
+            return None
+        revision = self.ref(control["delivery_protocol_ref"], True)
+        require(revision.get("schema_version") == 2 and type(revision["schema_version"]) is int and
+                revision.get("run_id") == self.run.name and type(revision.get("to_epoch")) is int and revision.get("to_epoch") == control["epoch"] and
+                type(revision.get("from_epoch")) is int and 0 < revision["from_epoch"] < revision["to_epoch"],
+                "protocol_revision", "explicit current run/epoch transition required")
+        self.protocol = revision
+        for reference in revision["norm_refs"]:
+            self.ref(reference)
+        mapping = obj(revision["task_mappings"], "task_mappings").get(task["task_id"])
+        if mapping is None:
+            return None
+        require(mapping.get("task_ref") == record.get("ref") and task["epoch"] == revision["from_epoch"],
+                "protocol_task_binding", "mapping must bind original immutable task")
+        require(set(mapping) <= {"task_ref", "deliverable", "delivery_readiness_refs"}, "protocol_mapping_fields", "delivery-only mapping")
+        self.load_archive(revision["norm_archive_ref"])
+        skill = str(Path(__file__).resolve().parent.parent)
+        # Scientific criteria and user permissions cannot be revised through this delivery migration.
+        self.protocol_norms = {str(Path(home) / name) for home in (skill, str(Path.home() / ".claude/skills/idea-hunt"), str(Path.home() / ".agents/skills/idea-hunt"))
+                               for name in ("SKILL.md", "参考/任务接口.md")}
+        expected_norms = {r["path"] for r in task.get("input_refs", []) if r.get("path") in self.protocol_norms}
+        require(expected_norms <= {r["path"] for r in revision["norm_refs"]}, "protocol_norm_missing",
+                "mapped historical delivery norms also require current exact norm references")
+        return mapping
+
+    def delivery_readiness(self, task, delivery, mapping=None):
+        root = parse(self.read(self.raw_run / "状态.json"), "root")
+        refs = (mapping or task).get("delivery_readiness_refs")
+        require(type(refs) is list and len(refs) == 2, "delivery_readiness_missing", "author and receiving Leader must confirm a viable route", "hold")
+        actors = [task["agent_id"], delivery["reader_id"]]
+        require(len(set(actors)) == 2, "delivery_readiness_binding", "independent author and receiver required")
+        for actor, source in zip(actors, refs):
+            receipt = parse(self.native_message(source, actor, root["total_leader"]), "delivery readiness")
+            expected = {"kind": "delivery_readiness", "run_id": self.run.name, "task_id": task["task_id"],
+                        "epoch": root["harness_control"]["epoch"], "agent_id": actor,
+                        "author_id": task["agent_id"], "reader_id": delivery["reader_id"],
+                        "format": delivery["format"], "version": delivery["version"],
+                        "delivery_plan": delivery.get("delivery_plan"), "allowed": True}
+            require(all(type(receipt.get(k)) is type(v) and receipt[k] == v for k, v in expected.items()),
+                    "delivery_readiness_binding", "real session confirmation differs or blocks delivery", "hold")
+            text(receipt.get("constraints"), "session constraints summary")
+            require(timestamp(receipt.get("checked_at"), "checked_at") <= datetime.datetime.now(datetime.timezone.utc),
+                    "delivery_readiness_time", "future confirmation")
+
     def local_capability(self, task, record, control, required, *, operation_only=False):
         """Check declared local authority; real tool permission remains the caller's responsibility."""
         scope = obj(task.get("task_scope"), "task_scope")
@@ -468,6 +615,8 @@ class Checker:
 
     def delivery_route(self, task, record, delivery, *, admission=False, preserving=False):
         plan = delivery.get("delivery_plan")
+        require(delivery.get("format") != "message" or plan is not None,
+                "delivery_plan_mode", "message delivery requires an explicit native-message plan")
         if plan is None:
             if admission:
                 root = parse(self.read(self.raw_run / "状态.json"), "root")
@@ -475,6 +624,12 @@ class Checker:
             return None
         obj(plan, "delivery_plan")
         mode = plan.get("mode")
+        if delivery.get("format") == "message":
+            require(plan == {"mode": "native-message"}, "delivery_plan_mode", "native-message route required")
+            if admission:
+                root = parse(self.read(self.raw_run / "状态.json"), "root")
+                self.local_capability(task, record, root["harness_control"], {"read_local", "generate_local"})
+            return {"mode": "native-message"}
         require(mode in {"direct", "delegated-archive"}, "delivery_plan_mode", "direct or delegated-archive required")
         fields = {"mode", "target"} | ({"archive_task_id", "archive_agent_id"} if mode == "delegated-archive" else set())
         require(set(plan) == fields, "delivery_plan_fields", "exact delivery plan fields required")
@@ -520,20 +675,27 @@ class Checker:
     def delivery_facts(self, delivery, label="output_delivery"):
         obj(delivery, label)
         text(delivery.get("version"), label + ".version")
-        self.ref(delivery.get("material_ref"))
+        require(("material_ref" in delivery) != ("message_ref" in delivery), "output_identity", "exactly one file or message original required")
+        if "message_ref" in delivery:
+            self.message_ref(delivery["message_ref"])
+        else:
+            self.ref(delivery.get("material_ref"))
         times = {k: timestamp(delivery[k], label + "." + k) for k in FACTS if k in delivery}
         require("formed_at" in times, "delivery_fact_missing", label + ".formed_at")
-        for k in ("delivered_at", "archived_at", "read_at"):
+        for k in ("delivered_at", "archived_at", "retained_at", "received_at", "read_at"):
             if k in times:
                 require(times[k] >= times["formed_at"], "fact_order", k + " precedes formation")
         if "read_at" in times:
-            require("delivered_at" in times and times["read_at"] >= times["delivered_at"],
-                    "fact_order", "output read needs prior delivery")
+            received = times.get("delivered_at", times.get("received_at") if "message_ref" in delivery else None)
+            require(received is not None and times["read_at"] >= received,
+                    "fact_order", "output read needs prior observed full delivery")
             text(delivery.get("reader_id"), label + ".reader_id")
+            original = "message_ref" if "message_ref" in delivery else "material_ref"
             require(delivery.get("read_version") == delivery["version"] and
-                    delivery.get("read_material_ref") == delivery["material_ref"],
-                    "output_read_mismatch", "read must bind current version and material hash")
-            self.ref(delivery["read_material_ref"])
+                    delivery.get("read_" + original) == delivery[original],
+                    "output_read_mismatch", "read must bind current version and complete original")
+            if original == "material_ref":
+                self.ref(delivery["read_material_ref"])
         return times
 
     def facts(self, record):
@@ -558,7 +720,9 @@ class Checker:
         if record["status"] == "completed":
             require("delivered_at" in times, "delivery_fact_missing", "completed needs actual input delivery")
             if "output_delivery" in record:
-                require("delivered_at" in record["output_delivery"], "delivery_fact_missing", "completed needs actual output delivery")
+                require("delivered_at" in record["output_delivery"] or
+                        ("message_ref" in record["output_delivery"] and "received_at" in record["output_delivery"]),
+                        "delivery_fact_missing", "completed needs actual output delivery")
             else:
                 require("formed_at" in times and "material_ref" in record,
                         "delivery_fact_missing", "legacy completed needs formed_at and material_ref")
@@ -566,12 +730,13 @@ class Checker:
     def scientific(self, task, record, *, admission=False, preserve_existing=False):
         if "scientific_work_ref" not in task:
             return  # Existing input JSON may already contain unrelated scientific_work data.
+        self.protocol_mapping(task, record)
         ref = obj(task["scientific_work_ref"], "scientific_work_ref")
         require(any(r.get("path") == ref.get("path") and r.get("sha256") == ref.get("sha256")
                     for r in task["input_refs"]), "scientific_input_ref", "contract must be an existing input ref")
         work = obj(self.ref(ref, True).get("scientific_work"), "scientific_work")
-        require(type(work.get("schema_version")) is int and work["schema_version"] == 1,
-                "scientific_schema", "scientific_work v1 required")
+        require(type(work.get("schema_version")) is int and work["schema_version"] in {1, 2},
+                "scientific_schema", "scientific_work v1 or v2 required")
         text(work.get("decision_question"), "decision_question")
         premises = obj(work.get("premises"), "premises")
         require(set(premises) == {"required_facts", "allowed_assumptions", "deferred_unknowns"},
@@ -583,10 +748,50 @@ class Checker:
         for k in routes:
             text(routes[k], "outcome_routes." + k)
         delivery = obj(work.get("deliverable"), "deliverable")
-        require(delivery.get("format") == "markdown", "scientific_format", "markdown required")
+        mapping = self.protocol_mapping(task, record)
+        if mapping and "deliverable" in mapping:
+            revised = obj(mapping["deliverable"], "mapped deliverable")
+            require(revised.get("version") == delivery.get("version") and revised.get("reader_id") == delivery.get("reader_id"),
+                    "protocol_delivery_binding", "migration preserves version and actual receiving Leader")
+            delivery = revised
+        require(delivery.get("format") in {"markdown", "message"}, "scientific_format", "markdown or message required")
+        if delivery["format"] == "message":
+            require(work["schema_version"] == 2 or mapping is not None, "scientific_schema", "message delivery requires explicit v2 adoption")
+            text(delivery.get("version"), "version")
+            text(delivery.get("reader_id"), "reader_id")
+            self.delivery_route(task, record, delivery, admission=admission)
+            if admission:
+                self.delivery_readiness(task, delivery, mapping)
+            output = record.get("output_delivery")
+            if output is not None:
+                self.delivery_facts(output)
+                reference = obj(output.get("message_ref"), "message_ref")
+                require(reference["task_id"] == task["task_id"] and reference["author_id"] == task["agent_id"] and
+                        reference["reader_id"] == delivery["reader_id"] and reference["version"] == output["version"] == delivery["version"],
+                        "message_delivery_binding", "message must bind actual author, receiver, task and version")
+                for key, actor, kind in (("producer_receipt_ref", task["agent_id"], "scientific_delivery"),
+                                          ("read_receipt_ref", delivery["reader_id"], "scientific_read")):
+                    if key == "read_receipt_ref" and "read_at" not in output:
+                        continue
+                    receipt = parse(self.native_message(output.get(key), actor, parse(self.read(self.raw_run / "状态.json"), "root")["total_leader"]), kind)
+                    require(receipt.get("kind") == kind and receipt.get("message_ref") == reference and
+                            receipt.get("version") == output["version"], "message_receipt_binding", "native full-original receipt differs")
+                    clock = "formed_at" if key == "producer_receipt_ref" else "read_at"
+                    require(timestamp(receipt.get(clock), clock) == timestamp(output.get(clock), clock),
+                            "message_receipt_time", "native receipt time differs")
+                if "read_at" in output:
+                    require(output["reader_id"] == delivery["reader_id"], "output_reader", "actual reader differs")
+            if record["status"] == "completed":
+                require(output is not None and all(k in output for k in ("retained_at", "read_at")) and
+                        ("delivered_at" in output or "received_at" in output),
+                        "scientific_delivery_missing", "completed message needs delivery, retention and full read")
+                self.delivery_readiness(task, delivery, mapping)
+            return
         text(delivery.get("version"), "deliverable.version")
         text(delivery.get("reader_id"), "deliverable.reader_id")
         route = self.delivery_route(task, record, delivery, admission=admission)
+        if admission:
+            self.delivery_readiness(task, delivery, mapping)
         output = record.get("output_delivery")
         if output is not None:
             self.delivery_facts(output)
@@ -1161,7 +1366,9 @@ class Checker:
         number(control.get("epoch"), "epoch")
         require(control["epoch"] > 0, "epoch", "epoch must be positive")
         number(task.get("epoch"), "task.epoch")
-        require(task["epoch"] == control["epoch"], "epoch_stale", self.task_id)
+        record = obj(control["tasks"].get(self.task_id), "registered task")
+        mapping = self.protocol_mapping(task, record)
+        require(task["epoch"] == control["epoch"] or mapping is not None, "epoch_stale", self.task_id)
         if effective_pause(root, control) and self.phase != "checkpoint":
             raise GateError("run_paused", "dispatch and entry remain paused")
         if self.phase == "checkpoint":
@@ -1179,6 +1386,10 @@ class Checker:
         for reference in inputs:
             self.ref(reference, norm=reference != task.get("scientific_work_ref"))
         self.output(task.get("output_dir"))
+        message_inputs = task.get("message_input_refs", [])
+        require(type(message_inputs) is list, "type", "message_input_refs must be an array")
+        for original in message_inputs:
+            self.message_ref(original)
         scope = obj(task.get("task_scope"), "task_scope")
         require(set(scope) <= {"allowed_actions", "allowed_stages", "limits"}, "scope_unknown_fields",
                 ", ".join(sorted(set(scope) - {"allowed_actions", "allowed_stages", "limits"})), "hold")
@@ -1274,6 +1485,8 @@ class Checker:
         else:
             cp = obj(record.get("checkpoint"), "checkpoint")
             self.refs(cp.get("saved_refs"), "checkpoint.saved_refs")
+            for original in cp.get("saved_messages", []):
+                self.message_ref(original)
             missing = strings(cp.get("missing_sections"), "checkpoint.missing_sections")
             if missing:
                 self.notice("checkpoint_incomplete", ", ".join(missing))
@@ -1283,7 +1496,7 @@ class Checker:
         if self.phase == "entry":
             # Produce the receipt only after this exact read set passed its final recheck.
             self.receipt = {"task_id": self.task_id, "agent_id": task["agent_id"], "stage": task["stage"],
-                            "epoch": task["epoch"], "phase": "entry", "decision": "allow", "ok": True,
+                            "epoch": control["epoch"], "phase": "entry", "decision": "allow", "ok": True,
                             "root_sha256": self.snapshots[self.root_path],
                             "task_sha256": self.snapshots[self.task_path],
                             "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
@@ -1379,6 +1592,8 @@ def inspect_run(run, task=None, status=None, agent=None, limit=20, cursor=None):
                     "stage": short(row.get("stage")), "status": short(row.get("status")),
                     "ref": brief_ref(row.get("ref")), "scientific_work_ref": brief_ref(envelope.get("scientific_work_ref")),
                     "output_ref": brief_ref(output.get("material_ref")) if type(output) is dict else None,
+                    "output_kind": ("message" if "message_ref" in output else "file") if output else None,
+                    "output_message_sha256": short(output.get("message_ref", {}).get("source", {}).get("payload_sha256")),
                     "output_version": short(output.get("version")) if type(output) is dict else None,
                     "missing_sections": [short(v) for v in missing[:4]] if type(missing) is list else [],
                     "missing_sections_total": len(missing) if type(missing) is list else None}

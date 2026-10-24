@@ -13,6 +13,7 @@ import tempfile
 import unittest
 import zipfile
 import shutil
+import uuid
 from unittest import mock
 from pathlib import Path
 
@@ -45,7 +46,8 @@ class Fixture:
         self.control = {"schema_version": 1, "epoch": 1, "paused": False,
                         "permissions": {"allowed_actions": sorted(gate.ACTIONS), "denied_actions": []},
                         "tasks": {"t1": self.record}, "recoveries": {}}
-        self.root = {"run_id": self.run.name, "status": "running", "harness_control": self.control}
+        self.root = {"run_id": self.run.name, "status": "running", "total_leader": "main", "harness_control": self.control}
+        self.auto_readiness = True
         self.path = self.run / "任务.json"
         self.contract = None
 
@@ -62,7 +64,44 @@ class Fixture:
         p = Path(p)
         return {"path": str(p.relative_to(self.run)), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
 
+    def native(self, name, actor, reader, value):
+        payload = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        block = {"type": "tool_use", "name": "SendMessage", "id": "tool-" + name,
+                 "input": {"to": reader, "message": payload}}
+        record = {"type": "assistant", "agentId": actor, "uuid": str(uuid.uuid5(uuid.NAMESPACE_URL, name)),
+                  "message": {"role": "assistant", "content": [block]}}
+        raw = (json.dumps(record, ensure_ascii=False) + "\n").encode()
+        path = self.run / (name + ".jsonl")
+        path.write_bytes(raw)
+        paths = self.control.setdefault("native_message_bindings", {}).setdefault(actor, [])
+        if str(path.resolve()) not in paths:
+            paths.append(str(path.resolve()))
+        return {"path": str(path.resolve()), "line": 1, "record_uuid": record["uuid"],
+                "pointer": "/message/content/0/input/message", "raw_line_sha256": hashlib.sha256(raw).hexdigest(),
+                "payload_bytes": len(payload.encode()), "payload_sha256": hashlib.sha256(payload.encode()).hexdigest(),
+                "utf8_start": 0, "utf8_end": len(payload.encode()), "tool_use_id": block["id"]}
+
+    def readiness(self, task, delivery):
+        refs = []
+        for actor in [task["agent_id"], delivery["reader_id"]]:
+            value = {"kind": "delivery_readiness", "run_id": self.run.name, "task_id": task["task_id"],
+                     "epoch": self.control["epoch"], "agent_id": actor, "author_id": task["agent_id"],
+                     "reader_id": delivery["reader_id"], "format": delivery["format"], "version": delivery["version"],
+                     "delivery_plan": delivery.get("delivery_plan"), "allowed": True, "checked_at": TIME,
+                     "constraints": "Synthetic fixture: this exact delivery route is allowed."}
+            refs.append(self.native("readiness-" + task["task_id"] + "-" + actor, actor, self.root["total_leader"], value))
+        return refs
+
     def write(self):
+        if self.auto_readiness and "scientific_work_ref" in self.task:
+            ref = self.task["scientific_work_ref"]
+            try:
+                work = json.loads((self.run / ref["path"]).read_bytes()).get("scientific_work")
+            except (ValueError, OSError, AttributeError):
+                work = None
+            if (isinstance(work, dict) and isinstance(work.get("deliverable"), dict) and
+                    all(isinstance(work["deliverable"].get(k), str) for k in ("format", "version", "reader_id"))):
+                self.task["delivery_readiness_refs"] = self.readiness(self.task, work["deliverable"])
         if self.contract is not None:
             cref = self.put("合同.json", self.contract)
             self.task["contract_refs"] = [cref]
@@ -1541,7 +1580,7 @@ class GateTests(unittest.TestCase):
         tree = ast.parse(SCRIPT.read_text())
         imported = {n.names[0].name for n in ast.walk(tree) if isinstance(n, ast.Import)}
         imported.update(n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom))
-        self.assertEqual(imported, {"argparse", "datetime", "errno", "hashlib", "io", "json", "math", "re", "sys", "zipfile", "zlib", "pathlib"})
+        self.assertEqual(imported, {"argparse", "datetime", "errno", "hashlib", "io", "json", "math", "os", "stat", "uuid", "re", "sys", "zipfile", "zlib", "pathlib"})
         forbidden = {"write_bytes", "write_text", "mkdir", "unlink", "rename", "system", "exec", "eval", "spawn"}
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):

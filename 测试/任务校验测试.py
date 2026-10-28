@@ -586,6 +586,41 @@ class GateTests(unittest.TestCase):
                     "checkpoint": {"saved_refs": [], "missing_sections": []}}
         f.control["tasks"][task_id] = f.record
 
+    def replacement_with_other_history_refusal(self):
+        f = self.f
+        f.recovery()
+        other = copy.deepcopy(f.task)
+        other.update(task_id="old-other", agent_id="old-agent")
+        other.pop("recovery_of", None)
+        f.control["tasks"]["old-other"] = {
+            "ref": f.put("原角色其他历史.json", other), "agent_id": "old-agent",
+            "stage": other["stage"], "status": "completed", "refusal_actions": ["read_local"]}
+        return f.control["tasks"]["old-other"]
+
+    def test_regression_replacement_inherits_other_actor_history_refusal(self):
+        f = self.f
+        other = self.replacement_with_other_history_refusal()
+        f.check(expected=1, diagnostic="permission_denied")
+        other["refusal_actions"] = []
+        unrelated = copy.deepcopy(f.task)
+        unrelated.update(task_id="unrelated", agent_id="unrelated-agent")
+        unrelated.pop("recovery_of", None)
+        f.control["tasks"]["unrelated"] = {
+            "ref": f.put("无关角色任务.json", unrelated), "agent_id": "unrelated-agent",
+            "stage": unrelated["stage"], "status": "completed", "refusal_actions": ["read_local"]}
+        f.check()
+
+    def test_regression_local_delivery_inherits_other_actor_history_refusal(self):
+        f = self.f
+        other = self.replacement_with_other_history_refusal()
+        f.write()
+        checker = gate.Checker(f.run, f.path, "dispatch")
+        with self.assertRaises(gate.GateError) as caught:
+            checker.local_capability(f.task, f.record, f.control, {"read_local"})
+        self.assertEqual(caught.exception.code, "permission_denied")
+        other["refusal_actions"] = []
+        self.assertNotIn("read_local", checker.local_capability(f.task, f.record, f.control, {"read_local"}))
+
     def test_regression_ancestor_refusal_survives_second_replacement(self):
         f = self.f
         f.recovery()

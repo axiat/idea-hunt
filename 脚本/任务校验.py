@@ -95,7 +95,13 @@ def constraints(value, label):
 def timestamp(value, label):
     text(value, label)
     try:
-        t = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        normalized = value.replace("Z", "+00:00")
+        offset = re.search(r"([+-])([0-9]{2})([0-9]{2})$", normalized)
+        if offset:
+            require(int(offset[2]) < 24 and int(offset[3]) < 60,
+                    "timestamp", label + " invalid timezone offset")
+            normalized = normalized[:offset.start()] + offset[1] + offset[2] + ":" + offset[3]
+        t = datetime.datetime.fromisoformat(normalized)
         require(t.tzinfo is not None, "timestamp", label + " needs timezone")
         return t
     except ValueError:
@@ -572,17 +578,27 @@ class Checker:
         return denied
 
     def inherited_refusals(self, task, control):
+        """Retain refusals from every recovered actor's history and its recovery ancestors."""
         denied = set()
         ancestors = set(self.ancestors(task, control))
+        actors = {text(task["agent_id"], "agent_id")}
+        actors.update(text(control["tasks"][tid].get("agent_id"), "ancestor.agent_id") for tid in ancestors)
+        scanned = set()
+        while actors - scanned:
+            actor = min(actors - scanned)
+            scanned.add(actor)
+            for tid, prior in control["tasks"].items():
+                obj(prior, "task record")
+                if prior.get("agent_id") == actor and tid != task["task_id"]:
+                    historical = self.ref(prior.get("ref"), True)
+                    require(historical.get("task_id") == tid and historical.get("agent_id") == prior.get("agent_id")
+                            and historical.get("stage") == prior.get("stage"), "route_mismatch", tid)
+                    historical_ancestors = self.ancestors(historical, control)
+                    ancestors.update(historical_ancestors)
+                    actors.update(text(control["tasks"][old_id].get("agent_id"), "ancestor.agent_id")
+                                  for old_id in historical_ancestors)
         for tid, prior in control["tasks"].items():
-            obj(prior, "task record")
-            if prior.get("agent_id") == task["agent_id"] and tid != task["task_id"]:
-                historical = self.ref(prior.get("ref"), True)
-                require(historical.get("task_id") == tid and historical.get("agent_id") == prior.get("agent_id")
-                        and historical.get("stage") == prior.get("stage"), "route_mismatch", tid)
-                ancestors.update(self.ancestors(historical, control))
-        for tid, prior in control["tasks"].items():
-            if prior.get("agent_id") == task["agent_id"] or tid in ancestors:
+            if prior.get("agent_id") in actors or tid in ancestors:
                 denied.update(strings(prior.get("refusal_actions", []), "refusal_actions"))
         return denied
 
@@ -1419,8 +1435,7 @@ class Checker:
         recovery = task.get("recovery_of", {})
         obj(recovery, "recovery_of")
         ancestors = self.ancestors(task, control)
-        permission_ancestors = set(ancestors)
-        # A healthy new task retains this actual agent's previous recovery read/permission history.
+        # Load this actual agent's previous envelopes for ordinary role-reuse validation.
         # Ordinary old task scopes and resolved failure identities are not inherited.
         historical_tasks = {}
         for tid, old in tasks.items():
@@ -1430,30 +1445,37 @@ class Checker:
                 require(historical.get("task_id") == tid and historical.get("agent_id") == old.get("agent_id")
                         and historical.get("stage") == old.get("stage"), "route_mismatch", tid)
                 historical_tasks[tid] = historical
-                permission_ancestors.update(self.ancestors(historical, control))
         for r in restrictions:
             denied.update(strings(self.ref(r, True).get("denied_actions"), "restriction.denied_actions"))
+        denied.update(self.inherited_refusals(task, control))
         for tid, old in tasks.items():
             obj(old, "task record")
-            if old.get("agent_id") == task["agent_id"] or tid in permission_ancestors:
-                denied.update(strings(old.get("refusal_actions", []), "refusal_actions"))
             if tid != self.task_id and old.get("agent_id") == task["agent_id"]:
                 cancelled = "unstarted_cancellation" in old
                 if cancelled:
                     self.unstarted_cancelled(tid, old, root.get("total_leader"))
                 if self.phase != "checkpoint" and not cancelled:
-                    require(old.get("status") in {"completed", "stopped", "failed"}, "agent_busy", tid)
+                    if old.get("status") not in {"completed", "stopped", "failed"}:
+                        self.execution_blocker = {
+                            "task_id": tid, "agent_id": old.get("agent_id"),
+                            "task_ref": {key: old["ref"].get(key) for key in ("path", "sha256")},
+                            "recorded_runtime_id": old.get("runtime_id"), "unknown_is_not_evidence": True,
+                            "required_evidence": ["The prior logical task must complete or have a real stop before a different task can reuse this actor."],
+                            "native_context_followup": native_context_followup(tid, old)}
+                        raise GateError("agent_busy", tid)
                     if old["status"] in {"failed", "stopped"}:
                         if old.get("runtime_state") not in {None, "unknown"}:
                             require(old["runtime_state"] == "stopped", "runtime_not_stopped", tid)
                         if (old.get("runtime_state") in {None, "unknown"} or old.get("runtime_id") is None or
                                 old.get("stop_receipt_ref") is None):
                             self.execution_blocker = {
-                                "task_id": tid, "agent_id": old.get("agent_id"), "task_ref": old.get("ref"),
+                                "task_id": tid, "agent_id": old.get("agent_id"),
+                            "task_ref": {key: old["ref"].get(key) for key in ("path", "sha256")},
                                 "recorded_runtime_id": old.get("runtime_id"),
                                 "required_evidence": ["A real stop receipt bound to the original task, agent and runtime.",
                                     "For a rejected, never-dispatched preparation only: cancel_unstarted with positive non-dispatch evidence."],
-                                "unknown_is_not_evidence": True}
+                                "unknown_is_not_evidence": True,
+                                "native_context_followup": native_context_followup(tid, old)}
                             raise GateError("stop_evidence_missing", tid, "hold")
                         self.stopped(tid, old)
                     else:
@@ -1528,6 +1550,20 @@ def check_task(run, task, phase, *, checkpoint_archive_ref=None):
     if code == 0 and phase == "entry":
         result["receipt"] = checker.receipt
     return code, result
+
+
+def native_context_followup(task_id, record):
+    """A routing hint cannot establish liveness, stop evidence or action permission."""
+    agent_id = record.get("agent_id")
+    if record.get("status") not in {"delivered", "accepted", "started", "failed", "stopped"}:
+        return None
+    if not all(type(value) is str and value and len(value.encode("utf-8")) <= 384 and
+               not any(char.isspace() for char in value) for value in (task_id, agent_id)):
+        return None
+    return {"tool": "SendMessage", "to": agent_id, "task_id": task_id,
+            "purpose": "identity_and_checkpoint_only", "action_permission": False,
+            "native_route": "not_checked", "repeat_without_new_evidence": False,
+            "reference": str(Path(__file__).resolve().parents[1] / "参考" / "原生续接.md")}
 
 
 def inspect_run(run, task=None, status=None, agent=None, limit=20, cursor=None):
@@ -1611,6 +1647,7 @@ def inspect_run(run, task=None, status=None, agent=None, limit=20, cursor=None):
                 "runtime_state": short(row.get("runtime_state")), "runtime_id": short(row.get("runtime_id")),
                 "stop_receipt_ref": brief_ref(row.get("stop_receipt_ref")),
                 "unstarted_cancelled_at": short(marker.get("cancelled_at")) if type(marker) is dict else None}
+            item["native_context_followup"] = None if marker else native_context_followup(tid, row)
             result["tasks"].append(item)
             # Reserve enough space for the continuation token and snapshot metadata.
             if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > INSPECT_BYTES - 2200:

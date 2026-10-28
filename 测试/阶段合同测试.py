@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline stage contracts: scientific unknowns are not action permissions."""
+import copy
 import importlib.util
 import unittest
 from pathlib import Path
@@ -135,6 +136,138 @@ class StageContractTests(unittest.TestCase):
                 code, checked = gate.check_task(self.f.run, self.f.path, "dispatch")
                 self.assertEqual(code, 1, checked)
                 self.assertEqual(checked["diagnostics"][-1]["code"], "run_paused")
+
+    def test_basic_timezone_offsets_keep_the_same_instant(self):
+        for compact, extended in (
+            ("2026-10-24T15:40:32+0800", "2026-10-24T15:40:32+08:00"),
+            ("2026-10-24T15:40:32.123456-0530", "2026-10-24T15:40:32.123456-05:30"),
+            ("2026-10-24T15:40:32+0000", "2026-10-24T15:40:32Z"),
+        ):
+            with self.subTest(timestamp=compact):
+                self.assertEqual(gate.timestamp(compact, "observed_at"), gate.timestamp(extended, "observed_at"))
+
+    def test_basic_timezone_support_keeps_invalid_and_naive_times_rejected(self):
+        for value in ("2026-10-24T15:40:32+2400", "2026-10-24T15:40:32+0860", "2026-10-24T15:40:32+1260",
+                      "2026-10-24T15:40:32-0099", "2026-10-24T15:40:32", "not-a-time+0800"):
+            with self.subTest(timestamp=value):
+                with self.assertRaises(gate.GateError):
+                    gate.timestamp(value, "observed_at")
+
+    def test_started_entry_accepts_preserved_basic_timezone_facts(self):
+        basic = "2026-10-14T18:00:00+0800"
+        self.f.record.update(status="started", delivered_at=basic, accepted_at=basic,
+                             started_at=fixtures.TIME, runtime_id="agent1", runtime_state="unknown")
+        self.f.check("entry")
+        self.assertEqual(self.f.record["delivered_at"], basic)
+        self.assertEqual(self.f.record["accepted_at"], basic)
+        self.assertEqual(self.f.record["runtime_state"], "unknown")
+        self.assertNotIn("stop_receipt_ref", self.f.record)
+
+    def test_native_followup_is_a_readonly_original_actor_hint(self):
+        self.f.record.update(status="started", delivered_at=fixtures.TIME,
+                             accepted_at=fixtures.TIME, started_at=fixtures.TIME)
+        self.f.write()
+        root = self.f.run / "状态.json"
+        before = root.read_bytes()
+        code, result = gate.inspect_run(self.f.run, task="t1")
+        self.assertEqual(code, 0, result)
+        hint = result["tasks"][0]["native_context_followup"]
+        self.assertEqual(hint["tool"], "SendMessage")
+        self.assertEqual(hint["to"], self.f.task["agent_id"])
+        self.assertEqual(hint["task_id"], "t1")
+        self.assertEqual(hint["purpose"], "identity_and_checkpoint_only")
+        self.assertEqual(hint["native_route"], "not_checked")
+        self.assertFalse(hint["action_permission"])
+        self.assertFalse(hint["repeat_without_new_evidence"])
+        self.assertTrue(Path(hint["reference"]).is_file())
+        self.assertEqual(root.read_bytes(), before)
+
+    def test_native_followup_never_truncates_or_invents_a_target(self):
+        for actor in (None, "", "a" * 385, "agent name", "agent\nother"):
+            with self.subTest(actor=actor):
+                self.assertIsNone(gate.native_context_followup("t1", {"agent_id": actor, "status": "started"}))
+        for status in ("registered", "completed", "unknown"):
+            with self.subTest(status=status):
+                self.assertIsNone(gate.native_context_followup("t1", {"agent_id": "agent1", "status": status}))
+
+    def test_same_started_task_continues_without_invented_stop(self):
+        self.f.record.update(status="started", delivered_at=fixtures.TIME,
+                             accepted_at=fixtures.TIME, started_at=fixtures.TIME,
+                             runtime_id="agent1", runtime_state="unknown",
+                             action_used={"generate_local": 1})
+        self.f.record["runtime_incident_ref"] = self.f.put("原生中断.json", {
+            "task_id": "t1", "agent_id": "agent1", "failure_id": "api-error-1",
+            "native_error": "synthetic stream error", "logical_terminal_observed": False})
+        result = self.f.check("entry")
+        self.assertEqual(result["receipt"]["task_id"], "t1")
+        self.assertEqual(self.f.record["status"], "started")
+        self.assertEqual(self.f.record["started_at"], fixtures.TIME)
+        self.assertEqual(self.f.record["runtime_state"], "unknown")
+        self.assertNotIn("stop_receipt_ref", self.f.record)
+        self.assertEqual(self.f.control["recoveries"], {})
+        self.assertEqual(self.f.record["action_used"], {"generate_local": 1})
+
+    def test_original_context_reentry_keeps_pause_refusal_and_limits(self):
+        self.f.record.update(status="started", delivered_at=fixtures.TIME,
+                             accepted_at=fixtures.TIME, started_at=fixtures.TIME)
+        self.f.control["paused"] = True
+        self.f.check("entry", expected=1, diagnostic="run_paused")
+        self.f.control["paused"] = False
+        self.f.record["refusal_actions"] = ["generate_local"]
+        self.f.check("entry", expected=1, diagnostic="permission_denied")
+        self.f.record.pop("refusal_actions")
+        self.f.record["action_used"] = {"generate_local": 2}
+        self.f.check("entry", expected=1, diagnostic="scope_exhausted")
+
+    def test_original_context_reentry_cannot_revive_logical_terminal(self):
+        self.f.record.update(delivered_at=fixtures.TIME, accepted_at=fixtures.TIME,
+                             started_at=fixtures.TIME, failure_id="f1")
+        for status in ("failed", "stopped"):
+            with self.subTest(status=status):
+                self.f.record["status"] = status
+                self.f.check("entry", expected=1, diagnostic="task_not_delivered")
+
+    def test_unrelated_actor_failure_does_not_pause_independent_science(self):
+        prior = copy.deepcopy(self.f.task)
+        prior.update(task_id="other-task", agent_id="other-agent")
+        row = {"ref": self.f.put("其他组任务.json", prior), "agent_id": "other-agent",
+               "stage": prior["stage"], "status": "started", "runtime_state": "unknown"}
+        self.f.control["tasks"]["other-task"] = row
+        self.f.check()
+        row.update(status="failed", failure_id="other-api-error")
+        self.f.check()
+        self.assertFalse(self.f.control["paused"])
+        self.assertNotIn("stop_receipt_ref", row)
+
+    def test_new_task_stays_blocked_while_original_context_can_be_contacted(self):
+        prior = copy.deepcopy(self.f.task)
+        prior["task_id"] = "old-task"
+        row = {"ref": self.f.put("原任务.json", prior), "agent_id": prior["agent_id"],
+               "stage": prior["stage"], "status": "started", "runtime_state": "unknown"}
+        self.f.control["tasks"]["old-task"] = row
+        result = self.f.check(expected=1, diagnostic="agent_busy")
+        blocker = result["execution_blocker"]
+        self.assertEqual(blocker["task_id"], "old-task")
+        self.assertEqual(blocker["native_context_followup"]["to"], prior["agent_id"])
+        self.assertFalse(blocker["native_context_followup"]["action_permission"])
+        row.update(status="failed", failure_id="api-error")
+        result = self.f.check(expected=2, diagnostic="stop_evidence_missing")
+        self.assertTrue(result["execution_blocker"]["unknown_is_not_evidence"])
+        self.assertFalse(result["execution_blocker"]["native_context_followup"]["action_permission"])
+
+    def test_execution_blocker_does_not_echo_reference_annotations(self):
+        prior = copy.deepcopy(self.f.task)
+        prior["task_id"] = "old-task"
+        ref = self.f.put("原任务.json", prior)
+        ref["note"] = "synthetic annotation " * 50000
+        row = {"ref": ref, "agent_id": prior["agent_id"], "stage": prior["stage"], "status": "started"}
+        self.f.control["tasks"]["old-task"] = row
+        for status, expected, diagnostic in (("started", 1, "agent_busy"), ("failed", 2, "stop_evidence_missing")):
+            with self.subTest(status=status):
+                row["status"] = status
+                result = self.f.check(expected=expected, diagnostic=diagnostic)
+                self.assertEqual(set(result["execution_blocker"]["task_ref"]), {"path", "sha256"})
+                self.assertLess(len(fixtures.json.dumps(result)), 4096)
 
     def test_new_output_without_plan_still_stays_in_its_task_directory(self):
         import copy
